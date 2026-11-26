@@ -19,10 +19,10 @@ index fe94d79..f86c62b 100644
  Organon runs on the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) 0.1.7 as two plugins and an agent preset, **Evolve Mode**. This repository contains the plugins, the preset, a one-command setup, and the benchmark tasks with their evaluators. The instructions below are written for Linux, with DSH run from a source clone, including inside a Docker container reached over SSH.
 diff --git a/REPRODUCTION.md b/REPRODUCTION.md
 new file mode 100644
-index 0000000..247c770
+index 0000000..e2d6858
 --- /dev/null
 +++ b/REPRODUCTION.md
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,59 @@
 +# Restricted Organon reproduction
 +
 +Both versions retain model-authored search plugins. V1 exposes custom scheduling, parent selection and survival functions. V2 adds a one-candidate direction and a dynamic direction function. Both versions share the same Worker, model route, tool permissions, evaluator, and input construction. Start each comparison from a fresh copy of the same task with matching model settings and budget.
@@ -35,7 +35,14 @@ index 0000000..247c770
 +
 +## JavaScript hook contract
 +
-+The source body returns an object exporting any subset of the permitted functions. Each function receives a private JSON snapshot with `history`, `alive`, `budget`, `k`, and `maxPopulation`. Functions execute synchronously in a fresh VM context with a 250 ms limit. Carry decisions across calls through the recorded history or update the plugin between chunks. The host performs candidate allocation, Worker invocation, scoring, history recording and budget enforcement.
++The source body returns an object exporting any subset of the permitted functions. Each function receives a private JSON snapshot with `history`, `alive`, `budget`, `k`, and `maxPopulation`. The host performs candidate allocation, Worker invocation, scoring, history recording and budget enforcement.
++
++One VM context stays live for each activated plugin version in a task run. Module variables are shared across that plugin's hooks and persist across candidate iterations and `evolve_run` chunks. Each synchronous call has a 250 ms limit and receives two additional fields:
++
++- `state.turn` is the zero-based call index of the current hook in this activation. To refer to the total number of candidate slots used, use `state.budget.used`.
++- `state.memory` starts as an empty JSON object and is shared by all hooks in the same plugin. Write durable counters, cursors, or other small state into this object. Successful hook calls checkpoint it alongside their turn counters in `run/search-policy.json`. The hook result and memory share a 65,536-character JSON limit.
++
++On process restart the plugin code initializes a new VM context. Its checkpointed `turn` and `memory` are available on the first call. Activating a different version or deactivating the plugin discards the replaced activation's state. Activating the already active version preserves it.
 +
 +| Function | Contract |
 +| --- | --- |
@@ -162,20 +169,27 @@ index 157d398..d930223 100644
      name: 'evolve_run',
 diff --git a/plugins/dsh-evolve-loop/src/policy-code.js b/plugins/dsh-evolve-loop/src/policy-code.js
 new file mode 100644
-index 0000000..d095e7d
+index 0000000..31f82fd
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/src/policy-code.js
-@@ -0,0 +1,35 @@
-+/** Run a guest search policy with data-only inputs and a synchronous time bound. */
+@@ -0,0 +1,54 @@
++/** Keep guest functions live while passing only serialized data across the VM boundary. */
 +import { createContext, Script } from 'node:vm'
 +
-+export function executePlugin(code, allowed, slot, state) {
++const OPTIONS = { timeout: 250 }
++const SOURCE = { filename: 'organon-policy.js' }
++
++export function createPlugin(code, allowed) {
 +  if (typeof code !== 'string' || !code.trim() || code.length > 32_768) {
 +    throw new Error('host_code must contain 1–32,768 characters of JavaScript.')
 +  }
-+  const input = JSON.stringify(JSON.stringify(state ?? null))
-+  const script = new Script(
-+    '"use strict"; (() => {\n'
++  const realm = createContext(Object.create(null), {
++    codeGeneration: { strings: false, wasm: false },
++    microtaskMode: 'afterEvaluate',
++  })
++  const initialize = new Script(
++    '"use strict"; const __organon = (() => {\n'
++    + ' const stringify = JSON.stringify, parse = JSON.parse;\n'
 +    + ' const policy = (() => {\n' + code + '\n})();\n'
 +    + ' if (policy === null || typeof policy !== "object" || Array.isArray(policy)) '
 +    + 'throw new Error("Return an object with search policy functions.");\n'
@@ -183,23 +197,35 @@ index 0000000..d095e7d
 +    + ' if (!keys.length || keys.some(key => !' + JSON.stringify(allowed)
 +    + '.includes(key) || typeof policy[key] !== "function")) '
 +    + 'throw new Error("Only enabled search hooks can be exported: " + ' + JSON.stringify(allowed.join(', ')) + ');\n'
-+    + (slot === undefined ? 'return JSON.stringify(keys);\n'
-+      : ' const result = policy[' + JSON.stringify(slot) + '](JSON.parse(' + input + '));\n'
-+        + ' if (result === undefined || (result && typeof result.then === "function")) '
-+        + 'throw new Error("Return a synchronous JSON value.");\n'
-+        + ' return JSON.stringify(result);\n')
-+    + '})()',
-+    { filename: 'organon-policy.js' },
++    + ' return (slot, serialized) => {\n'
++    + '   if (slot === null) return stringify(keys);\n'
++    + '   const state = parse(serialized);\n'
++    + '   const result = policy[slot](state);\n'
++    + '   if (result === undefined || (result && typeof result.then === "function")) '
++    + 'throw new Error("Return a synchronous JSON value.");\n'
++    + '   return stringify({ result, memory: state.memory });\n'
++    + ' };\n'
++    + '})(); __organon(null);',
++    SOURCE,
 +  )
-+  const realm = createContext(Object.create(null), {
-+    codeGeneration: { strings: false, wasm: false },
-+    microtaskMode: 'afterEvaluate',
-+  })
-+  const result = script.runInContext(realm, { timeout: 250 })
-+  if (typeof result !== 'string' || result.length > 65_536) {
-+    throw new Error('Search plugin output must be serializable JSON under 65,536 characters.')
++  const slots = JSON.parse(initialize.runInContext(realm, OPTIONS))
++  return {
++    slots,
++    invoke(slot, state) {
++      if (!slots.includes(slot)) throw new Error('Inactive search hook: ' + slot)
++      const call = new Script('__organon(' + JSON.stringify(slot) + ','
++        + JSON.stringify(JSON.stringify(state)) + ');', SOURCE)
++      const output = call.runInContext(realm, OPTIONS)
++      if (typeof output !== 'string' || output.length > 65_536) {
++        throw new Error('Search plugin output and memory must fit in 65,536 JSON characters.')
++      }
++      const value = JSON.parse(output)
++      if (!Object.hasOwn(value, 'result') || !value.memory || typeof value.memory !== 'object' || Array.isArray(value.memory)) {
++        throw new Error('Return a JSON result and preserve state.memory as a JSON object.')
++      }
++      return value
++    },
 +  }
-+  return JSON.parse(result)
 +}
 diff --git a/plugins/dsh-evolve-loop/src/providers/mutate.js b/plugins/dsh-evolve-loop/src/providers/mutate.js
 index 35e316b..cc5744d 100644
@@ -233,10 +259,10 @@ index 35e316b..cc5744d 100644
  
 diff --git a/plugins/dsh-evolve-loop/src/restricted.js b/plugins/dsh-evolve-loop/src/restricted.js
 new file mode 100644
-index 0000000..235c57a
+index 0000000..bf6ad06
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/src/restricted.js
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,347 @@
 +/** Restricted Organon tools. Guest policies only return search decisions. */
 +import { resolve, sep } from 'node:path'
 +import { readFile, realpath } from 'node:fs/promises'
@@ -245,7 +271,7 @@ index 0000000..235c57a
 +import { DEFAULT_K, DEFAULT_MAX_POPULATION } from './evolve.js'
 +import { filesOf } from './files.js'
 +import { alive, merit, readPopulation } from './population.js'
-+import { executePlugin } from './policy-code.js'
++import { createPlugin } from './policy-code.js'
 +
 +const FILE = 'search-policy.json'
 +const CONFIGURATION_TOOLS = ['evolve_define', 'evolve_activate', 'evolve_deactivate', 'evolve_plugins',
@@ -272,12 +298,13 @@ index 0000000..235c57a
 +
 +async function readState(root, variant) {
 +  const text = await filesOf(root).read(FILE)
-+  if (text === undefined) return { variant, plugins: [], active: [], revisions: [], nextGuidance: '' }
++  if (text === undefined) return { variant, plugins: [], active: [], revisions: [], nextGuidance: '', pluginState: {} }
 +  const state = JSON.parse(text)
 +  if (state.variant !== variant) throw new Error('Use a separate task workspace for each Organon variant.')
 +  if (!Array.isArray(state.plugins) || !Array.isArray(state.active)) {
 +    throw new Error('Use a fresh task workspace for the runtime-plugin baseline.')
 +  }
++  state.pluginState ??= {}
 +  return state
 +}
 +
@@ -356,8 +383,7 @@ index 0000000..235c57a
 +  return new Set(result)
 +}
 +
-+function scheduleRun(state, allowed, root, hooks) {
-+  const invoke = (slot, input) => executePlugin(hooks[slot].code, allowed, slot, input)
++function scheduleRun(state, root, hooks, invoke) {
 +  return async (_args, evolve) => {
 +    const population = evolve.population()
 +    const { candidates, maxPopulation, k, task } = await evolve.context()
@@ -378,12 +404,12 @@ index 0000000..235c57a
 +      const remaining = Math.min(candidates - used, feed.budget.remaining)
 +      if (!remaining) break
 +      const options = { ...feed, remaining }
-+      const scheduled = hooks.loop ? invoke('loop', options) : null
++      const scheduled = hooks.loop ? await invoke('loop', options) : null
 +      const batch = Array.isArray(scheduled) ? scheduled : [scheduled]
 +      if (!batch.length || batch.length > remaining) throw new Error('loop must schedule between 1 and remaining candidates.')
 +      const plans = []
 +      for (const item of batch) {
-+        const selected = item ?? (hooks.select ? invoke('select', options) : await evolve.select(population))
++        const selected = item ?? (hooks.select ? await invoke('select', options) : await evolve.select(population))
 +        plans.push(normalizePlan(selected, feed.history))
 +      }
 +      for (const { parent_id, donors } of plans) {
@@ -393,7 +419,7 @@ index 0000000..235c57a
 +        })))
 +        const fixedParent = feed.history.find(row => row.id === parent_id)
 +        const oneShot = state.nextGuidance
-+        const dynamic = hooks.guidance && !oneShot ? guidanceText(invoke('guidance', {
++        const dynamic = hooks.guidance && !oneShot ? guidanceText(await invoke('guidance', {
 +          ...(await view()), primary: fixedParent, donors: donorsForPrompt,
 +        })) : ''
 +        const guidance = oneShot || dynamic
@@ -415,7 +441,7 @@ index 0000000..235c57a
 +          if (!hooks.survive) {
 +            await evolve.survive(population)
 +          } else {
-+            const survivors = chooseSurvivors(invoke('survive', after), after.alive, maxPopulation)
++            const survivors = chooseSurvivors(await invoke('survive', after), after.alive, maxPopulation)
 +            await population.write(after.history.map(row => row.survival === 'yes' && !survivors.has(row.id)
 +              ? { ...row, survival: 'no' } : row))
 +          }
@@ -432,6 +458,12 @@ index 0000000..235c57a
 +  if (!['v1', 'v2'].includes(variant)) throw new Error('ORGANON_VARIANT must be v1 or v2.')
 +  if (!Number.isSafeInteger(budget) || budget < 1) throw new Error('ORGANON_BUDGET must be a positive integer.')
 +  const allowed = ['loop', 'select', 'survive', ...(variant === 'v2' ? ['guidance'] : [])]
++  // One live realm per activated version and run. Different tasks can reuse version IDs.
++  const liveRuns = new Map()
++  function runtimes(root) {
++    if (!liveRuns.has(root)) liveRuns.set(root, new Map())
++    return liveRuns.get(root)
++  }
 +  ctx.tools.guard(restrictedToolGuard)
 +  const field = (type, description, required = false) => ({ type, description, required })
 +  let busy = false
@@ -459,13 +491,15 @@ index 0000000..235c57a
 +    + 'Hooks: loop returns one or more parent plans; null entries delegate to selection. Select returns an ID or {parent_id, donors}. '
 +    + 'survive returns retained IDs at the population threshold. V2 may export guidance(state) returning text. '
 +    + 'State exposes history, alive, budget, k and maxPopulation; loop also gets remaining, guidance gets primary and donors. '
++    + 'Hooks share module variables until deactivation or process restart. State also includes a zero-based '
++    + 'hook turn and shared state.memory, which you can update with JSON to survive restart. '
 +    + 'Hooks run synchronously on copied data. Activate the returned version to use it.', {
 +    name: field('string', 'Plugin name.', true),
 +    purpose: field('string', 'Expected effect and evidence.', true),
 +    host_code: field('string', 'JavaScript body returning the hook object.', true),
 +    plugin_id: field('string', 'Existing plugin ID when defining a new version.'),
 +  }, async (args, _exec, { root }, state) => {
-+    const slots = executePlugin(args.host_code, allowed)
++    const { slots } = createPlugin(args.host_code, allowed)
 +    const plugin = args.plugin_id ? pluginById(state, args.plugin_id) : { id: 'evo-' + (state.plugins.length + 1), versions: [] }
 +    if (!args.plugin_id) state.plugins.push(plugin)
 +    const id = plugin.id + '-v' + (plugin.versions.length + 1)
@@ -478,19 +512,28 @@ index 0000000..235c57a
 +  }, async (args, _exec, { root }, state) => {
 +    const plugin = pluginById(state, args.plugin_id)
 +    const version = packageById(plugin, args.package_id)
-+    executePlugin(version.code, allowed)
++    const current = state.active.find(active => active.plugin_id === plugin.id)
++    const live = runtimes(root)
++    const retained = current?.package_id === version.id
++    const runtime = (retained && live.get(version.id)) || createPlugin(version.code, allowed)
++    if (current && !retained) delete state.pluginState[current.package_id]
 +    state.active = state.active.filter(active => active.plugin_id !== plugin.id)
 +    const entry = { plugin_id: plugin.id, package_id: version.id }
 +    state.active.push(entry)
 +    await revise(root, state, { kind: 'activate', ...entry })
++    if (current && !retained) live.delete(current.package_id)
++    live.set(version.id, runtime)
 +    return { ...entry, providers: inventory(state).providers }
 +  }, true)
 +  tool('evolve_deactivate', 'Deactivate a plugin and restore the previous provider for its hooks.', {
 +    plugin_id: field('string', 'Plugin ID.', true),
 +  }, async (args, _exec, { root }, state) => {
 +    pluginById(state, args.plugin_id)
++    const current = state.active.find(active => active.plugin_id === args.plugin_id)
++    if (current) delete state.pluginState[current.package_id]
 +    state.active = state.active.filter(active => active.plugin_id !== args.plugin_id)
 +    await revise(root, state, { kind: 'deactivate', plugin_id: args.plugin_id })
++    if (current) runtimes(root).delete(current.package_id)
 +    return inventory(state)
 +  }, true)
 +  tool('evolve_plugins', 'List defined versions and currently active hooks.', {},
@@ -545,7 +588,19 @@ index 0000000..235c57a
 +      state.routing = routing
 +      await save(root, state)
 +    }
-+    const dispose = evolve.register('loop', scheduleRun(state, allowed, root, providers(state)))
++    const hooks = providers(state)
++    const live = runtimes(root)
++    async function invoke(slot, input) {
++      const { version, code } = hooks[slot]
++      if (!live.has(version)) live.set(version, createPlugin(code, allowed))
++      const checkpoint = state.pluginState[version] ?? { turns: {}, memory: {} }
++      const turn = checkpoint.turns[slot] ?? 0
++      const { result, memory } = live.get(version).invoke(slot, { ...input, turn, memory: checkpoint.memory })
++      state.pluginState[version] = { turns: { ...checkpoint.turns, [slot]: turn + 1 }, memory }
++      await save(root, state)
++      return result
++    }
++    const dispose = evolve.register('loop', scheduleRun(state, root, hooks, invoke))
 +    try {
 +      return await evolve.run({
 +        maxBudget: budget, maxPopulation: DEFAULT_MAX_POPULATION, k: DEFAULT_K, candidates: args.candidates,
@@ -557,10 +612,10 @@ index 0000000..235c57a
 +}
 diff --git a/plugins/dsh-evolve-loop/tests/restricted.node.mjs b/plugins/dsh-evolve-loop/tests/restricted.node.mjs
 new file mode 100644
-index 0000000..74ddc7a
+index 0000000..1a8a9e8
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/tests/restricted.node.mjs
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,149 @@
 +import { strict as assert } from 'node:assert'
 +import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
@@ -570,20 +625,19 @@ index 0000000..74ddc7a
 +import { Evolve } from '../src/evolve.js'
 +import { defaultInstruction } from '../src/providers/mutate.js'
 +import { installRestrictedTools, restrictedToolGuard } from '../src/restricted.js'
-+import { executePlugin } from '../src/policy-code.js'
++import { createPlugin } from '../src/policy-code.js'
 +
 +const FIXTURE = fileURLToPath(new URL('./fixtures/task/', import.meta.url))
 +
 +test('guest hooks use only allowed exports and data-only input', () => {
 +  const allowed = ['loop','select','survive']
 +  for (const key of ['guidance', 'model', 'evaluate', 'mutate']) {
-+    assert.throws(() => executePlugin('return { ' + key + '() {} }', allowed), /Only enabled/)
++    assert.throws(() => createPlugin('return { ' + key + '() {} }', allowed), /Only enabled/)
 +  }
-+  assert.throws(() => executePlugin('while (true) {}', allowed), /timed out/)
-+  const state = { budget: { used: 2 } }
-+  const output = executePlugin('return { loop(s) { s.budget.used = 900; return [typeof process, typeof require] } }',
-+    allowed, 'loop', state)
-+  assert.deepEqual(output, ['undefined', 'undefined'])
++  assert.throws(() => createPlugin('while (true) {}', allowed), /timed out/)
++  const state = { budget: { used: 2 }, memory: {} }
++  const plugin = createPlugin('return { loop(s) { s.budget.used = 900; return [typeof process, typeof require] } }', allowed)
++  assert.deepEqual(plugin.invoke('loop', state).result, ['undefined', 'undefined'])
 +  assert.equal(state.budget.used, 2)
 +})
 +
@@ -652,9 +706,9 @@ index 0000000..74ddc7a
 +    options.model = 'other-model'
 +    await assert.rejects(call('evolve_run', { candidates: 1 }), /model route/)
 +    options.model = 'fixed-model'
-+    const code = 'return { '
-+      + 'loop(s) { return Array(Math.min(s.remaining, 3)).fill(null) }, '
-+      + 'select(s) { return { parent_id: s.alive.at(-1).id, donors: [s.history[0].id] } }, '
++    const code = 'let localTurn = 0; return { '
++      + 'loop(s) { localTurn++; (s.memory.turns ??= []).push([s.turn, localTurn]); return Array(Math.min(s.remaining, 3)).fill(null) }, '
++      + 'select(s) { s.memory.lastSelectionSaw = localTurn; return { parent_id: s.alive.at(-1).id, donors: [s.history[0].id] } }, '
 +      + 'survive(s) { return [s.alive.at(-1).id] }'
 +      + (variant === 'v2' ? ', guidance(s) { return "Use branch " + s.primary.id }' : '')
 +      + ' }'
@@ -662,7 +716,21 @@ index 0000000..74ddc7a
 +    assert.deepEqual((await call('evolve_plugins')).providers, {})
 +    await call('evolve_activate', { plugin_id: def.plugin_id })
 +    if (variant === 'v2') await call('evolve_set_guidance', { guidance: 'Prioritize small parameter changes.' })
-+    assert.deepEqual(await call('evolve_run', { candidates: 8 }), { best_id: 'c000009', best_fitness: 19, remaining: 0 })
++    await call('evolve_run', { candidates: 4 })
++    await call('evolve_activate', { plugin_id: def.plugin_id, package_id: def.package_id })
++    await call('evolve_run', { candidates: 1 })
++    const readCheckpoint = async () => JSON.parse(await readFile(join(task, 'run', 'search-policy.json'), 'utf8'))
++    assert.deepEqual((await readCheckpoint()).pluginState[def.package_id], {
++      turns: { loop: 3, select: 5, ...(variant === 'v2' ? { guidance: 4 } : {}) },
++      memory: { turns: [[0, 1], [1, 2], [2, 3]], lastSelectionSaw: 3 },
++    })
++    // A fresh service instance simulates a DSH restart with the same task state.
++    installRestrictedTools(ctx, new Evolve(ctx), x => x, { variant, budget: 9 })
++    assert.deepEqual(await call('evolve_run', { candidates: 3 }), { best_id: 'c000009', best_fitness: 19, remaining: 0 })
++    const restored = (await readCheckpoint()).pluginState[def.package_id]
++    assert.deepEqual(restored.memory.turns, [[0, 1], [1, 2], [2, 3], [3, 1]])
++    assert.equal(restored.turns.loop, 4)
++    assert.equal(restored.turns.select, 8)
 +    const status = await call('evolve_status')
 +    assert.deepEqual(status.history.slice(2,5).map(row => row.parent), ['c000001', 'c000001', 'c000001'])
 +    assert.deepEqual(status.history.filter(r => r.survival === 'yes').map(r => r.id), ['c000009'])
@@ -674,6 +742,7 @@ index 0000000..74ddc7a
 +    await assert.rejects(call('evolve_inspect', { artifact: 'evaluation', candidate_id: '../other' }), /Unknown/)
 +    await call('evolve_deactivate', { plugin_id: def.plugin_id })
 +    assert.deepEqual((await call('evolve_plugins')).providers, {})
++    assert.equal((await readCheckpoint()).pluginState[def.package_id], undefined)
 +    assert.deepEqual(await readFile(evaluator), evaluatorBefore)
 +    return requests
 +  }

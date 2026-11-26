@@ -11,3 +11,5 @@ node --test plugins/dsh-evolve-loop/tests/restricted.node.mjs
 ```
 
 The generated checkout's `REPRODUCTION.md` describes the Linux and Docker setup and the JavaScript hook contract. V1 lets the model write, activate, version and deactivate custom `loop`, `select` and `survive` plugins. V2 also supports single-candidate guidance and a dynamic `guidance` hook. Candidate generation copies one primary parent and includes any explicitly selected donors as reference code.
+
+An active version keeps its JavaScript variables across candidate iterations and search chunks. Hooks receive a persisted, zero-based `state.turn` and a shared JSON `state.memory` for state that must survive a process restart.
