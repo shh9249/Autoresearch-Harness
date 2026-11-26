@@ -1,0 +1,543 @@
+diff --git a/PROMPT.md b/PROMPT.md
+index 71e7908..5049f79 100644
+--- a/PROMPT.md
++++ b/PROMPT.md
+@@ -1 +1,2 @@
+ Improve the solution for the task in this folder by orchestrating and improving the search process. Fitness is the score given by the task's evaluator, and the total budget is 100 candidates. Run evolve_run in small chunks rather than using the full budget at once. Between chunks, analyze the results and determine which part or mechanism of the search is limiting progress, stalling, underperforming, or could be made more effective. Update and improve that specific search mechanism, then run another small chunk and repeat this process. Make improvements whenever the search stalls or when the run data suggests that some part of the search strategy could be better. Do not focus on directly solving the task yourself; your role is to orchestrate, diagnose, and improve the search strategy so that the search can discover better solutions. Do not use the web, do not search for existing solutions, and do not give any subagent the option to use the web or search externally for solutions.
++Experiment scope (takes precedence over the generic search skills): read the task, candidate sources, public evaluation files and history. Change the search by registering native loop, select or survive providers. Check evolve_status: if its provider stacks include guidance, you may also append candidate direction text. Keep the worker, evaluator, models, tools and material assembly fixed. Use the registered evolve tools for search changes and the file tools for inspection. Workers implement the candidates.
+diff --git a/plugins/dsh-evolve-loop/src/evolve.js b/plugins/dsh-evolve-loop/src/evolve.js
+index 98b2cf2..b790d1c 100644
+--- a/plugins/dsh-evolve-loop/src/evolve.js
++++ b/plugins/dsh-evolve-loop/src/evolve.js
+@@ -54,13 +54,14 @@ export class Evolve {
+   /** Active run metadata */
+   #current = undefined
+ 
+-  constructor(ctx) {
++  constructor(ctx, guidanceEnabled = false) {
+     this.ctx = ctx
+     this.#providers.set('loop', [loopProvider])
+     this.#providers.set('select', [selectProvider])
+     this.#providers.set('mutate', [mutateProvider])
+     this.#providers.set('evaluate', [evaluateProvider])
+     this.#providers.set('survive', [surviveProvider])
++    if (guidanceEnabled) this.#providers.set('guidance', [{ name: 'none', guidance: () => '' }])
+   }
+ 
+   /** Whether an evolve run is executing right now. */
+@@ -84,7 +85,7 @@ export class Evolve {
+    */
+   register(slot, provider) {
+     const key = normalizeSlot(slot)
+-    if (!PROVIDER_SLOTS.includes(key)) {
++    if (!this.#providers.has(key)) {
+       throw new Error(`cannot register provider for "${String(slot)}"; valid slots are: ${PROVIDER_SLOTS.join(', ')}`)
+     }
+ 
+@@ -137,7 +138,7 @@ export class Evolve {
+    */
+   listProviders() {
+     const result = {}
+-    for (const slot of PROVIDER_SLOTS) {
++    for (const slot of this.#providers.keys()) {
+       const provider = this.getProvider(slot)
+       result[slot] = provider.name ?? 'custom'
+     }
+@@ -151,7 +152,7 @@ export class Evolve {
+    */
+   providerStacks() {
+     const result = {}
+-    for (const slot of PROVIDER_SLOTS) {
++    for (const slot of this.#providers.keys()) {
+       result[slot] = this.#providers.get(slot).map(provider => (
+         typeof provider.name === 'string' && provider.name !== '' ? provider.name : 'custom'
+       ))
+@@ -215,6 +216,7 @@ export class Evolve {
+ 
+   /** Mutation delegate */
+   async mutate(options) {
++    if (this.searchBoundary) options = await this.searchBoundary.workerOptions(options)
+     const provider = this.getProvider('mutate')
+     const fn = provider.mutate ?? provider.improve ?? provider
+     if (typeof fn !== 'function') throw new Error('active mutate provider has no mutate method')
+diff --git a/plugins/dsh-evolve-loop/src/index.js b/plugins/dsh-evolve-loop/src/index.js
+index 157d398..8763693 100644
+--- a/plugins/dsh-evolve-loop/src/index.js
++++ b/plugins/dsh-evolve-loop/src/index.js
+@@ -12,6 +12,7 @@ import { budgetReport } from './budget.js'
+ import { runPaths } from './candidates.js'
+ import { Evolve, DEFAULT_MAX_POPULATION, DEFAULT_K } from './evolve.js'
+ import { registerRuntimeTools } from './runtime.js'
++import { createSearchBoundary, modifierGuard } from './search-boundary.js'
+ 
+ export const name = 'dsh-evolve-loop'
+ export const inject = ['tools', 'subagents']
+@@ -25,7 +26,12 @@ const RUN_REMINDER = 'Reminder: before changing the search, load the improving-t
+  * @param {object} ctx - the plugin context.
+  */
+ export function apply(ctx) {
+-  const evolve = new Evolve(ctx)
++  const variant = process.env.ORGANON_VARIANT ?? 'v1'
++  if (!['v1', 'v2'].includes(variant)) throw new Error('Use ORGANON_VARIANT=v1 or v2')
++  const evolve = new Evolve(ctx, variant === 'v2')
++  evolve.searchBoundary = createSearchBoundary(evolve, variant)
++  ctx.provide('organonSearch', { mount: evolve.searchBoundary.mount })
++  ctx.tools.guard(execution => modifierGuard(execution, evolve))
+   ctx.provide('evolve', evolve)
+ 
+   ctx.tools.register(defineTool({
+@@ -37,7 +43,7 @@ export function apply(ctx) {
+       + 'candidate, scores it with the task\'s evaluator (evaluator/evaluator.py, settings in task.json), records it '
+       + 'in population.jsonl, and culls excess candidates. '
+       + 'Returns the best candidate ID, its fitness, and remaining budget: { best_id, best_fitness, remaining }. '
+-      + 'All search components (evolve-loop, select, mutate, evaluate, survive) are swappable via ctx.evolve.register().',
++      + evolve.searchBoundary.description,
+     parameters: {
+       max_budget: {
+         type: 'integer',
+diff --git a/plugins/dsh-evolve-loop/src/providers/loop.js b/plugins/dsh-evolve-loop/src/providers/loop.js
+index 4616740..9464c82 100644
+--- a/plugins/dsh-evolve-loop/src/providers/loop.js
++++ b/plugins/dsh-evolve-loop/src/providers/loop.js
+@@ -42,10 +42,11 @@ export async function run(args, evolve) {
+     runState.signal.throwIfAborted()
+ 
+     // Selection
+-    const parentId = await evolve.select(population)
++    const selection = await evolve.select(population)
++    const parentId = typeof selection === 'string' ? selection : selection.parent
+ 
+     // Mutation & Allocation
+-    const candidate = await evolve.mutate({ parent: parentId })
++    const candidate = await evolve.mutate(typeof selection === 'string' ? { parent: parentId } : selection)
+     created += 1
+ 
+     // Evaluation
+@@ -55,6 +56,7 @@ export async function run(args, evolve) {
+     await population.append({
+       id: candidate.id,
+       parent: parentId,
++      ...(selection?.donors?.length && { donors: selection.donors }),
+       fitness,
+       survival: 'yes',
+     })
+diff --git a/plugins/dsh-evolve-loop/src/runtime.js b/plugins/dsh-evolve-loop/src/runtime.js
+index 37de335..cb3921f 100644
+--- a/plugins/dsh-evolve-loop/src/runtime.js
++++ b/plugins/dsh-evolve-loop/src/runtime.js
+@@ -13,6 +13,7 @@
+  */
+ 
+ import { defineTool } from '@deepseek-ai/dsh-tools'
++import { scopedHostCode } from './search-boundary.js'
+ 
+ /** The runner's id prefix for plugins these tools create (3–6 lowercase letters). */
+ export const PLUGIN_ID_PREFIX = 'evo'
+@@ -111,7 +112,7 @@ export function registerRuntimeTools(ctx, evolve) {
+     description:
+       'Record a dynamic plugin that changes the search at runtime, without running it. The code is host JavaScript '
+       + 'for the dynamic plugin sandbox; it reaches the search through the `evolve` service, typically '
+-      + '`ctx.effect(() => evolve.register(slot, provider))` for slot loop, select, mutate, evaluate or survive. '
++      + evolve.searchBoundary.description
+       + 'Omit plugin_id to create a new plugin; pass an existing plugin_id to add a new version of it (versions are '
+       + 'immutable). Returns { plugin_id, package_id, warnings }; warnings flag code that cannot register a provider as '
+       + 'expected. Activate it with evolve_activate. Plugins belong to this session and disappear when DSH restarts.',
+@@ -135,7 +136,7 @@ export function registerRuntimeTools(ctx, evolve) {
+           : { kind: 'new', idPrefix: PLUGIN_ID_PREFIX },
+         name: args.name,
+         purpose: args.purpose,
+-        code: { host: code },
++        code: { host: scopedHostCode(code) },
+       })
+       return { plugin_id: receipt.pluginId, package_id: receipt.packageId, warnings: hostCodeWarnings(code) }
+     },
+diff --git a/plugins/dsh-evolve-loop/src/search-boundary.js b/plugins/dsh-evolve-loop/src/search-boundary.js
+new file mode 100644
+index 0000000..b5636c2
+--- /dev/null
++++ b/plugins/dsh-evolve-loop/src/search-boundary.js
+@@ -0,0 +1,233 @@
++// Experiment permissions around Organon's native providers. Scheduling lives in
++// the submitted async functions; the host never interprets a search plan.
++import { lstat, readFile } from 'node:fs/promises'
++import { AsyncLocalStorage } from 'node:async_hooks'
++import { dirname, join, relative, sep } from 'node:path'
++import { candidatePath, isCandidate } from './candidates.js'
++import { defaultInstruction, defaultPersona } from './providers/mutate.js'
++
++const modifierTools = new Set([
++  'read', 'read_image', 'glob', 'grep', 'skill', 'todo_write', 'compact',
++  'cordis_inspect_list', 'cordis_inspect_query', 'evolve_run', 'evolve_status',
++  'evolve_define', 'evolve_activate', 'evolve_deactivate', 'evolve_plugins',
++])
++export function modifierGuard({ agent, name }, evolve) {
++  const header = agent?.session?.header
++  if (header?.origin === 'subagent' && evolve?.running) {
++    const run = evolve.currentRun()
++    if (header.parentSession === run.agent.id && typeof header.cwd === 'string'
++        && dirname(header.cwd) === join(run.root, 'candidates')) return
++  }
++  if (!modifierTools.has(name)) return 'The modifier may inspect evidence and install search providers only.'
++}
++
++export function scopedHostCode(code) {
++  // Parse the original body at define time. Compile it in the native runner's
++  // realm at activation, outside the lexical scope of the actual Cordis ctx.
++  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
++  new AsyncFunction(code)
++  return `delete globalThis.harness
++const Body = Object.getPrototypeOf(async function () {}).constructor
++const plugin = await new Body(${JSON.stringify(code)})()
++return { name: plugin.name, inject: ['organonSearch'], apply(ctx) {
++  return ctx.organonSearch.mount(plugin, init => ctx.effect(init))
++} }`
++}
++
++function searchFiles(files, checkWrite) {
++  async function writable(path) {
++    checkWrite()
++    const parts = relative(files.root, files.resolve(path)).split(sep)
++    const top = parts[0].toLowerCase()
++    if (['', 'budget.json', 'population.jsonl', 'candidates', 'evals'].includes(top)) {
++      throw new Error('This path is owned by the candidate, budget, population or evaluator service.')
++    }
++    let absolute = files.root
++    for (const part of parts) {
++      if (process.platform === 'win32' && /[:. ]$|:/.test(part)) throw new Error('Ambiguous file name')
++      absolute = join(absolute, part)
++      try {
++        if ((await lstat(absolute)).isSymbolicLink()) throw new Error('Cannot write through a symbolic link')
++      } catch (error) {
++        if (error.code !== 'ENOENT') throw error
++        break
++      }
++    }
++    return path
++  }
++  return Object.freeze({ ...files,
++    write: async (p, text) => files.write(await writable(p), text),
++    append: async (p, text) => files.append(await writable(p), text),
++    remove: async p => files.remove(await writable(p)),
++  })
++}
++
++export function createSearchBoundary(evolve, variant) {
++  const writableSlots = variant === 'v2' ? ['loop', 'select', 'survive', 'guidance'] : ['loop', 'select', 'survive']
++  const description = 'Register ' + writableSlots.join(', ') + ' using ctx.effect(() => ctx.evolve.register(slot, provider)). '
++    + 'Use native async provider signatures. The worker, evaluator and material builder are fixed. '
++    + (variant === 'v2' ? 'Guidance returns candidate direction text only. ' : '')
++  const pendingWorkers = new Map()
++  const activeWorkers = new Map()
++  const guidanceCall = new AsyncLocalStorage()
++  function checkWrite() {
++    if (guidanceCall.getStore()) throw new Error('Guidance may inspect the search and return direction text only.')
++  }
++  const method = slot => slot === 'loop' ? 'run' : slot
++
++  async function candidate(id) {
++    const { root } = evolve.currentRun()
++    if (!await isCandidate(root, id)) throw new Error('Unknown candidate ID: ' + String(id))
++    return { id, dir: candidatePath(root, id) }
++  }
++
++  function population() {
++    const pop = evolve.population()
++    async function checked(row) {
++      checkWrite()
++      // Snapshot before the await so the checked data is what gets written.
++      const record = structuredClone(row)
++      await candidate(record.id)
++      const evidence = await evolve.files.read('evals/' + record.id + '.json')
++      if (!evidence || !Number.isFinite(record.fitness) || JSON.parse(evidence).fitness !== record.fitness) {
++        throw new Error('Population fitness must match the official evaluation for ' + record.id)
++      }
++      return record
++    }
++    return Object.freeze({ runDir: pop.runDir, rows: pop.rows,
++      append: async row => pop.append(await checked(row)),
++      write: async rows => {
++        checkWrite()
++        return pop.write(await Promise.all(rows.map(checked)))
++      },
++    })
++  }
++
++  async function workerOptions(options = {}) {
++    const { parent, donors = [], guidance, parentFitness, ...rest } = options
++    if (Object.keys(rest).length || (guidance !== undefined && variant !== 'v2')) {
++      throw new Error('Worker settings are fixed. Use parent, optional donor IDs, and V2-only guidance.')
++    }
++    await candidate(parent)
++    if (parentFitness !== undefined &&
++        (await evolve.population().rows()).find(row => row.id === parent)?.fitness !== parentFitness) {
++      throw new Error('Parent fitness must match its recorded evaluation.')
++    }
++    if (!Array.isArray(donors)) throw new Error('donors must be candidate IDs')
++    const ids = [...donors]
++    const direction = guidance ?? (variant === 'v2'
++      ? await guidanceCall.run(true, () => evolve.getProvider('guidance').guidance({ parent, donors: [...ids] }, api)) : '')
++    if (typeof direction !== 'string') throw new Error('Guidance must return candidate direction text.')
++    if (!ids.length && !direction) return { parent }
++    const rows = await evolve.population().rows()
++    let instruction = defaultInstruction(rows.find(row => row.id === parent)?.fitness)
++    if (ids.length) {
++      const { task } = evolve.currentRun()
++      const { program } = JSON.parse(await readFile(join(task, 'task.json'), 'utf8'))
++      for (const id of ids) {
++        const donor = await candidate(id)
++        instruction += '\n\nReference candidate ' + id + ':\n' + await readFile(join(donor.dir, program), 'utf8')
++      }
++    }
++    if (direction) instruction += '\n\nSuggested direction for this candidate:\n' + direction
++    return { parent, instruction }
++  }
++
++  function provider(slot) {
++    if (slot === 'evolve-loop') slot = 'loop'
++    if (slot === 'improve') slot = 'mutate'
++    const entry = evolve.getProvider(slot)
++    const key = method(slot)
++    if (slot === 'evaluate' || slot === 'mutate') {
++      return { name: entry.name, [key]: api[key], ...(slot === 'mutate' ? { defaultInstruction, defaultPersona } : {}) }
++    }
++    const fn = entry[key] ?? entry['evolve-loop']
++    return { name: entry.name, [key]: arg => fn(arg, api) }
++  }
++
++  const api = Object.freeze({
++    context: () => evolve.context(),
++    currentRun() {
++      const { agent, signal, ...metadata } = evolve.currentRun()
++      // The native signal supports cancellation; the controller stays on the host.
++      return { ...metadata, signal }
++    },
++    listProviders: () => evolve.listProviders(), providerStacks: () => evolve.providerStacks(),
++    getProvider: provider, population, get files() { return searchFiles(evolve.files, checkWrite) },
++    copyTask: async () => {
++      checkWrite()
++      return await isCandidate(evolve.currentRun().root, 'c000000') ? candidate('c000000') : evolve.copyTask()
++    },
++    allocate: async parent => {
++      checkWrite()
++      const child = await evolve.allocate(parent)
++      pendingWorkers.set(child.dir, parent)
++      return child
++    },
++    async spawnWorker(dir, options = {}, nativeOptions = {}) {
++      checkWrite()
++      // Native split allocation/dispatch, with the same fixed worker as mutate.
++      const parent = pendingWorkers.get(dir)
++      if (!parent || dir !== candidatePath(evolve.currentRun().root, dir.split(sep).at(-1))) {
++        throw new Error('Worker dispatch requires a fresh allocation in this run.')
++      }
++      const fitness = (await evolve.population().rows()).find(row => row.id === parent)?.fitness
++      const standard = defaultInstruction(fitness)
++      if (typeof options === 'string') {
++        if (options !== standard || Object.entries(nativeOptions).some(([key, value]) =>
++          !(key === 'persona' && value === defaultPersona()) && !(key === 'label' && value === 'mutator'))) {
++          throw new Error('Worker prompt and options are fixed; pass donor IDs or V2 guidance instead.')
++        }
++        options = {}
++      }
++      const configured = await workerOptions({ ...options, parent })
++      if (!pendingWorkers.delete(dir)) throw new Error('Candidate already dispatched or evaluated.')
++      const job = evolve.spawnWorker(dir, configured.instruction ?? standard, {
++        label: 'mutator', persona: defaultPersona(),
++      })
++      activeWorkers.set(dir, job)
++      try { return await job } finally { activeWorkers.delete(dir) }
++    },
++    mutate: options => { checkWrite(); return evolve.mutate(options) },
++    async evaluate(ref) {
++      checkWrite()
++      const target = await candidate(ref?.id)
++      pendingWorkers.delete(target.dir)
++      await activeWorkers.get(target.dir)
++      return evolve.evaluate(target)
++    },
++    select: pop => { checkWrite(); return provider('select').select(pop ?? population()) },
++    survive: pop => { checkWrite(); return provider('survive').survive(pop ?? population()) },
++  })
++
++  function mount(plugin, bindEffect) {
++    // Register on the actual native provider stack and let its Cordis fiber
++    // own cleanup, including partial activation failures.
++    function register(slot, entry) {
++      if (slot === 'evolve-loop') slot = 'loop'
++      if (!writableSlots.includes(slot)) throw new Error('Read-only provider: ' + slot)
++      const key = method(slot)
++      const fn = typeof entry === 'function' ? entry : entry?.[key] ?? (slot === 'loop' ? entry?.['evolve-loop'] : undefined)
++      if (typeof fn !== 'function') throw new Error('Expected a function for ' + slot)
++      return evolve.register(slot, { name: entry.name || 'custom', [key](arg, caller) {
++        const nativePopulation = caller === evolve && (slot === 'select' || slot === 'survive')
++        return fn(nativePopulation ? population() : arg, scoped)
++      } })
++    }
++    const effect = init => {
++      checkWrite()
++      const dispose = bindEffect(() => init())
++      return () => { checkWrite(); return dispose() }
++    }
++    const attach = (slot, entry) => effect(() => register(slot, entry))
++    const scoped = Object.create(api, {
++      register: { value: attach }, replace: { value: attach },
++    })
++    const ctx = Object.freeze({ evolve: Object.freeze(scoped), get: name => name === 'evolve' ? scoped : undefined,
++      effect,
++    })
++    if (typeof plugin === 'function') return plugin(ctx)
++    return plugin.apply(ctx)
++  }
++  return { description, mount, workerOptions }
++}
+diff --git a/plugins/dsh-evolve-loop/tests/search-boundary.spec.ts b/plugins/dsh-evolve-loop/tests/search-boundary.spec.ts
+new file mode 100644
+index 0000000..74d474e
+--- /dev/null
++++ b/plugins/dsh-evolve-loop/tests/search-boundary.spec.ts
+@@ -0,0 +1,145 @@
++import { cp, mkdir, mkdtemp, readFile } from 'node:fs/promises'
++import { fileURLToPath } from 'node:url'
++import { join } from 'node:path'
++import { afterEach, expect, it, vi } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
++import Tools from '@deepseek-ai/dsh-tools'
++import Subprocess from '@deepseek-ai/dsh-subprocess-local'
++import Runner from '@deepseek-ai/dsh-cordis-host-runner'
++import * as organon from '../src/index.js'
++import { modifierGuard } from '../src/search-boundary.js'
++import { defaultInstruction, defaultPersona } from '../src/providers/mutate.js'
++
++let ctx: Context
++afterEach(async () => { try { await ctx?.fiber.dispose() } finally { vi.unstubAllEnvs() } })
++
++async function setup(variant: string) {
++  vi.stubEnv('ORGANON_VARIANT', variant)
++  const root = fileURLToPath(new URL('../.test-runs/', import.meta.url))
++  await mkdir(root, { recursive: true })
++  const task = await mkdtemp(join(root, 'scoped-'))
++  await cp(fileURLToPath(new URL('./fixtures/task/', import.meta.url)), task, { recursive: true })
++  const agent = { id: 'S-search', session: { id: 'S-search', header: { cwd: task } }, inject() {}, steer() {} }
++  const workers: any[] = []
++  ctx = new Context()
++  await ctx.plugin(SystemPrompt)
++  await ctx.plugin(Tools)
++  await ctx.plugin(Subprocess)
++  await ctx.plugin({ name: 'fixture-worker', apply(scope) {
++    scope.provide('subagents', { getProvider: () => ({}), async start(_name: string, req: any) {
++      workers.push(req)
++      return { result: Promise.resolve({ output: [], stopReason: 'completed' }), dispose() {} }
++    } } as never)
++  } })
++  await ctx.plugin(Runner)
++  await ctx.plugin(organon)
++  function call(name: string, args: object) {
++    return ctx.tools.get(name)!.execute(args as never, {
++      agent, name, callId: name, signal: new AbortController().signal,
++    } as never) as Promise<any>
++  }
++  async function activate(body: string) {
++    const { plugin_id } = await call('evolve_define', { name: 'policy', purpose: 'test', host_code: body })
++    return call('evolve_activate', { plugin_id })
++  }
++  return { activate, workers, call, task }
++}
++
++it('runs a stateful native async loop across chunks, with custom scheduling, survival and archives', async () => {
++  const { activate, call, workers, task } = await setup('v1')
++  await call('evolve_run', { max_budget: 6, candidates: 1 })
++  expect(workers[0].prompt[0].text).toBe(defaultInstruction(10))
++  const result = await activate(`return { inject: ['evolve'], apply(ctx) {
++    const e = ctx.evolve
++    let turns = 0
++    ctx.effect(() => e.register('select', pop => pop.rows().then(rows => rows[0].id)))
++    ctx.effect(() => e.register('survive', async pop => {
++      const rows = await pop.rows()
++      await pop.write(rows.map(row => ({ ...row, survival: (turns === 1) === (row.id === 'c000000') ? 'no' : 'yes' })))
++    }))
++    ctx.effect(() => e.register('loop', async (_args, api) => {
++      turns++
++      const pop = api.population()
++      const parent = await api.select(pop)
++      const children = await Promise.all([api.mutate({parent}), api.mutate({parent})])
++      for (const c of children.reverse()) {
++        const fitness = await api.evaluate(c)
++        await pop.append({ id: c.id, parent, fitness, survival: 'yes', turn: turns })
++      }
++      await api.survive(pop)
++      await api.files.write('turn.txt', String(turns))
++      return { turns, parent }
++    }))
++  } }`)
++  expect(result.ok, result.message).toBe(true)
++  const run = () => call('evolve_run', { max_budget: 6, candidates: 2 })
++  expect(await run()).toEqual({ turns: 1, parent: 'c000000' })
++  expect(await run()).toEqual({ turns: 2, parent: 'c000000' })
++  const rows = (await readFile(join(task, 'run/population.jsonl'), 'utf8')).trim().split('\n').map(s => JSON.parse(s))
++  expect(rows[0].survival).toBe('yes')
++  expect(rows.map(r => r.turn)).toEqual([undefined, undefined, 1, 1, 2, 2])
++  expect(await readFile(join(task, 'run/turn.txt'), 'utf8')).toBe('2')
++  expect((await call('evolve_deactivate', { plugin_id: result.plugin_id })).providers.loop).toEqual(['evolve-loop'])
++})
++
++it.each(['v1', 'v2'])('enforces modifier permissions at registration and invocation in %s', async variant => {
++  const { activate, call, workers } = await setup(variant)
++  for (const slot of ['evaluate', 'mutate', 'improve', 'model', 'tools', ...(variant === 'v1' ? ['guidance'] : [])]) {
++    const result = await activate(`return { apply(ctx) { ctx.evolve.register('${slot}', () => 0) } }`)
++    expect(result.ok).toBe(false)
++    expect(result.message).toContain('Read-only provider')
++  }
++  await call('evolve_run', { max_budget: 3, candidates: 1 })
++  const result = await activate(`return { apply(ctx) {
++    if (ctx.tools || ctx.get('fs') || ctx.evolve.ctx || globalThis.harness) throw Error('Unexpected host service')
++    ctx.evolve.register('loop', async (_, e) => {
++      for (const check of [() => e.mutate({parent:'c000000', model:'other'}),
++        () => e.files.write('candidates/c000000/solution.py', 'bad'),
++        () => e.files.remove('evals'), () => e.files.write('budget.json','{}'),
++        () => e.population().append({id:'c000000',fitness:999}),
++        () => e.spawnWorker('unallocated', {})]) {
++        try { await check() } catch { continue }
++        throw Error('Expected operation to be refused')
++      }
++      return 1
++    })
++  } }`)
++  expect(result.ok, result.message).toBe(true)
++  expect(await call('evolve_run', { max_budget: 3, candidates: 1 })).toBe(1)
++  expect(workers).toHaveLength(1)
++  for (const name of ['write', 'edit', 'bash', 'pwsh', 'plugin_manager', 'candidate-builder', 'subagent']) {
++    expect(modifierGuard({ agent: {}, name })).toBeTruthy()
++  }
++  expect(modifierGuard({ agent: {}, name: 'read' })).toBeUndefined()
++  const run = { running: true, currentRun: () => ({ agent: { id: 'S-search' }, root: 'run' }) }
++  const header = { parentSession: 'S-search', origin: 'subagent', cwd: join('run','candidates','c000001') }
++  expect(modifierGuard({ agent: { session: { header } }, name: 'edit' }, run)).toBeUndefined()
++  expect(modifierGuard({ agent: { session: { header } }, name: 'edit' }, { running: false })).toBeTruthy()
++})
++
++it('uses a fixed donor renderer and appends optional per-candidate V2 guidance to the original instruction', async () => {
++  const { activate, call, workers } = await setup('v2')
++  await call('evolve_run', { max_budget: 8, candidates: 5 })
++  const result = await activate(`return { apply(ctx) {
++    let n = 0
++    ctx.evolve.register('guidance', async ({parent}, e) => {
++      if (!(await e.population().rows()).some(r => r.id === parent)) throw Error('Missing parent')
++      try { await ctx.evolve.population().write([]) } catch { return 'Explore ' + (++n) }
++      throw Error('Guidance modified the search')
++    })
++    ctx.evolve.register('select', async pop => ({
++      parent:'c000000', donors:(await pop.rows()).slice(1,6).map(r => r.id)
++    }))
++  } }`)
++  expect(result.ok, result.message).toBe(true)
++  await call('evolve_run', { max_budget: 8, candidates: 2 })
++  for (const [idx, request] of workers.slice(-2).entries()) {
++    const text = request.prompt[0].text
++    expect(text.startsWith(defaultInstruction(10))).toBe(true)
++    expect(text.match(/Reference candidate c/g)).toHaveLength(5)
++    expect(text.endsWith('Explore ' + (idx + 1))).toBe(true)
++    expect(request.persona).toBe(defaultPersona())
++    expect(request.agentOptions).toBeUndefined()
++  }
++})

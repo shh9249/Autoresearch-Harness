@@ -4,6 +4,7 @@ This snapshot contains the FML search implementations, fixed-interval controller
 
 - [Search algorithms, controller and sampling](fml_search/README.md)
 - [AHC026 adapter and local judge](benchmarks/ale/README.md)
+- [Organon native search providers and experiment permissions](organon/README.md)
 - [FML-Bench attribution and license](fml_search/LICENSE-FML)
 
 To check source consistency, compare `git rev-parse HEAD` with the shared commit and run `git status --short` to check for local edits. The offline Python tests use scripted models and evaluators. From the checkout root, run:
