@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from . import APIError, sample_search
-from .candidate import deepseek_json
+from . import candidate
 from .control import decide
 from .test_search import edit
 from .test_resume import score, worker
@@ -122,6 +122,6 @@ class SamplingTests(unittest.TestCase):
             self.assertEqual(payload["response_format"],{"type":"json_object"})
             self.assertEqual(payload["thinking"],{"type":"disabled"})
             return io.BytesIO(b'{"choices":[{"message":{"content":"{}"}}]}')
-        with patch.dict(os.environ, DEEPSEEK_API_KEY="offline-test"), patch(
-                "autoresearch_rebuild.fml_search.candidate.urlopen",side_effect=response):
-            self.assertEqual(deepseek_json("JSON","test"),"{}")
+        with patch.dict(os.environ, DEEPSEEK_API_KEY="offline-test"), patch.object(
+                candidate, "urlopen", side_effect=response):
+            self.assertEqual(candidate.deepseek_json("JSON","test"),"{}")
