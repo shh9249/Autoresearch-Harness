@@ -19,10 +19,10 @@ index fe94d79..f86c62b 100644
  Organon runs on the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) 0.1.7 as two plugins and an agent preset, **Evolve Mode**. This repository contains the plugins, the preset, a one-command setup, and the benchmark tasks with their evaluators. The instructions below are written for Linux, with DSH run from a source clone, including inside a Docker container reached over SSH.
 diff --git a/REPRODUCTION.md b/REPRODUCTION.md
 new file mode 100644
-index 0000000..e2d6858
+index 0000000..5affefd
 --- /dev/null
 +++ b/REPRODUCTION.md
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,64 @@
 +# Restricted Organon reproduction
 +
 +Both versions retain model-authored search plugins. V1 exposes custom scheduling, parent selection and survival functions. V2 adds a one-candidate direction and a dynamic direction function. Both versions share the same Worker, model route, tool permissions, evaluator, and input construction. Start each comparison from a fresh copy of the same task with matching model settings and budget.
@@ -46,26 +46,31 @@ index 0000000..e2d6858
 +
 +| Function | Contract |
 +| --- | --- |
-+| `loop(state)` | Schedule one plan or an array of plans for the next step. Each item is a primary ID, an object `{parent_id, donors?}`, or `null` to invoke selection. The input supplies `remaining` for the chunk. The policy is called again after the plans run. |
-+| `select(state)` | Select one alive primary candidate by ID, or return `{parent_id, donors}`. If there is no custom selector the upstream fitness-proportional selector is used. |
-+| `survive(state)` | When the population reaches the fixed threshold, return a nonempty list of retained IDs from the alive population. The upstream top-k rule is the default. |
-+| `guidance(state)` | V2 only. Return up to 2,000 characters of direction for the current candidate, or an empty string. The input additionally supplies `primary` metadata and the selected `donors`. |
++| `*loop(state)` | Drive the search chunk by yielding fixed operations. Choose when to select, generate, evaluate, and update the population. Each yield receives the corresponding operation result. Return to end the chunk. |
++| `loop(state)` | Compatibility mode. Return one or more parent plans or `null` to delegate to selection. Runs the default generate, evaluate and threshold-triggered survival cycle. |
++| `select(state)` | Return a primary ID or `{parent_id, donors}`. Custom selectors can select any recorded or pending generated candidate. The default upstream fitness-proportional selector samples the alive population. |
++| `survive(state)` | Return the IDs that should be alive. A custom hook can reactivate any previously evaluated candidate. The default is upstream top-k on the alive population. |
++| `guidance(state)` | V2 only. Return a direction for the current candidate, or an empty string. The input additionally supplies `primary` metadata and the selected `donors`. |
 +
-+For example, a model can define a custom batch schedule and selector:
++The generator receives current history, pending candidates, the global budget and the remaining candidate slots in this chunk. Generate and evaluate can be interleaved freely. The fixed Worker runs once on generation and uses one candidate slot. An evaluation uses the fixed judge and records its official fitness. Requesting evaluation for an already scored ID returns its existing result. Unevaluated candidates remain pending across chunks, including after the generation budget is exhausted. Generator mode does not trigger automatic survival at the default threshold.
 +
 +```js
 +return {
-+  loop(state) {
-+    return Array(Math.min(state.remaining, 2)).fill(null)
-+  },
-+  select(state) {
-+    const parent = state.alive.at(-1)
-+    return { parent_id: parent.id }
++  *loop(state) {
++    if (state.remaining < 2) return
++    const parent = state.history[0].id
++    const a = yield { op: 'generate', parent_id: parent }
++    const b = yield { op: 'generate', parent_id: parent }
++    yield { op: 'evaluate', id: b.id }
++    yield { op: 'evaluate', id: a.id }
++    yield { op: 'set_population', ids: [parent, a.id, b.id] }
 +  }
 +}
 +```
 +
-+The Worker starts from the primary parent's workspace. A fixed prompt builder adds the nominated donors' IDs, official fitness and program text as reference data. Donors are optional, distinct and limited to four. To override the dynamic guidance on one candidate in V2, call `evolve_set_guidance`. That text is consumed after candidate allocation and Worker execution. The dynamic hook supplies guidance again for the following candidate. The default Worker persona and task instructions remain the base prompt. The Worker uses the same confined file tools across variants.
++The full operation set is `{op:'state'}`, `{op:'select'}`, `{op:'generate',parent_id,donors?}`, `{op:'evaluate',id}`, `{op:'survive'}` and `{op:'set_population',ids}`. `survive` calls the active survival policy. `set_population` updates membership directly using evaluated IDs, including archived candidates. Operations are executed one at a time.
++
++The Worker starts from the primary parent's workspace. A fixed prompt builder adds the nominated donors' IDs, any official fitness and program text as reference data. Donors are optional and distinct from one another and from the primary. To override dynamic guidance on one candidate in V2, call `evolve_set_guidance`. That text is consumed after candidate allocation and Worker execution. The dynamic hook supplies guidance again for the following candidate. The default Worker persona and task instructions remain the base prompt. The Worker uses the same confined file tools across variants.
 +
 +`run/search-policy.json` records the source code, versions, active hooks, fixed model settings and changes. `run/population.jsonl` records the primary parent, donors, supplied guidance and official fitness. The VM interface passes data only. Run the harness in the dedicated experiment environment for guest-code isolation at the process and OS level.
 +
@@ -169,10 +174,10 @@ index 157d398..d930223 100644
      name: 'evolve_run',
 diff --git a/plugins/dsh-evolve-loop/src/policy-code.js b/plugins/dsh-evolve-loop/src/policy-code.js
 new file mode 100644
-index 0000000..31f82fd
+index 0000000..660a1e7
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/src/policy-code.js
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,78 @@
 +/** Keep guest functions live while passing only serialized data across the VM boundary. */
 +import { createContext, Script } from 'node:vm'
 +
@@ -197,34 +202,58 @@ index 0000000..31f82fd
 +    + ' if (!keys.length || keys.some(key => !' + JSON.stringify(allowed)
 +    + '.includes(key) || typeof policy[key] !== "function")) '
 +    + 'throw new Error("Only enabled search hooks can be exported: " + ' + JSON.stringify(allowed.join(', ')) + ');\n'
-+    + ' return (slot, serialized) => {\n'
-+    + '   if (slot === null) return stringify(keys);\n'
-+    + '   const state = parse(serialized);\n'
-+    + '   const result = policy[slot](state);\n'
++    + ' let frame, memory;\n'
++    + ' return (command, slot, serialized) => {\n'
++    + '   if (command === "list") return stringify(keys);\n'
++    + '   if (command === "close") { frame = undefined; return; }\n'
++    + '   const input = parse(serialized);\n'
++    + '   let result;\n'
++    + '   if (command === "resume") {\n'
++    + '     const step = frame.next(input);\n'
++    + '     if (step && typeof step.then === "function") throw new Error("Use a synchronous generator for loop.");\n'
++    + '     if (step.done) frame = undefined;\n'
++    + '     return stringify({ result: step.value ?? null, yielded: !step.done, memory });\n'
++    + '   }\n'
++    + '   memory ??= input.memory;\n'
++    + '   Object.defineProperty(input, "memory", { enumerable: true, get: () => memory, set: value => { memory = value } });\n'
++    + '   result = policy[slot](input);\n'
++    + '   if (slot === "loop" && result && typeof result.next === "function") {\n'
++    + '     frame = result;\n'
++    + '     const step = frame.next();\n'
++    + '     if (step && typeof step.then === "function") throw new Error("Use a synchronous generator for loop.");\n'
++    + '     if (step.done) frame = undefined;\n'
++    + '     return stringify({ result: step.value ?? null, yielded: !step.done, finished: step.done, memory });\n'
++    + '   }\n'
 +    + '   if (result === undefined || (result && typeof result.then === "function")) '
 +    + 'throw new Error("Return a synchronous JSON value.");\n'
-+    + '   return stringify({ result, memory: state.memory });\n'
++    + '   return stringify({ result, memory });\n'
 +    + ' };\n'
-+    + '})(); __organon(null);',
++    + '})(); __organon("list");',
 +    SOURCE,
 +  )
 +  const slots = JSON.parse(initialize.runInContext(realm, OPTIONS))
++  function callGuest(command, slot, input) {
++    const args = [command, slot, JSON.stringify(input)].map(value => JSON.stringify(value))
++    const call = new Script('__organon(' + args.join(',') + ');', SOURCE)
++    const output = call.runInContext(realm, OPTIONS)
++    if (command === 'close') return
++    if (typeof output !== 'string' || output.length > 65_536) {
++      throw new Error('Search plugin output and memory must fit in 65,536 JSON characters.')
++    }
++    const value = JSON.parse(output)
++    if (!Object.hasOwn(value, 'result') || !value.memory || typeof value.memory !== 'object' || Array.isArray(value.memory)) {
++      throw new Error('Return a JSON result and preserve state.memory as a JSON object.')
++    }
++    return value
++  }
 +  return {
 +    slots,
 +    invoke(slot, state) {
 +      if (!slots.includes(slot)) throw new Error('Inactive search hook: ' + slot)
-+      const call = new Script('__organon(' + JSON.stringify(slot) + ','
-+        + JSON.stringify(JSON.stringify(state)) + ');', SOURCE)
-+      const output = call.runInContext(realm, OPTIONS)
-+      if (typeof output !== 'string' || output.length > 65_536) {
-+        throw new Error('Search plugin output and memory must fit in 65,536 JSON characters.')
-+      }
-+      const value = JSON.parse(output)
-+      if (!Object.hasOwn(value, 'result') || !value.memory || typeof value.memory !== 'object' || Array.isArray(value.memory)) {
-+        throw new Error('Return a JSON result and preserve state.memory as a JSON object.')
-+      }
-+      return value
++      return callGuest('invoke', slot, state)
 +    },
++    resume(value) { return callGuest('resume', null, value) },
++    close() { callGuest('close', null, null) },
 +  }
 +}
 diff --git a/plugins/dsh-evolve-loop/src/providers/mutate.js b/plugins/dsh-evolve-loop/src/providers/mutate.js
@@ -259,10 +288,10 @@ index 35e316b..cc5744d 100644
  
 diff --git a/plugins/dsh-evolve-loop/src/restricted.js b/plugins/dsh-evolve-loop/src/restricted.js
 new file mode 100644
-index 0000000..bf6ad06
+index 0000000..52e5368
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/src/restricted.js
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,426 @@
 +/** Restricted Organon tools. Guest policies only return search decisions. */
 +import { resolve, sep } from 'node:path'
 +import { readFile, realpath } from 'node:fs/promises'
@@ -356,7 +385,7 @@ index 0000000..bf6ad06
 +}
 +
 +function guidanceText(text) {
-+  if (typeof text !== 'string' || text.length > 2000) throw new Error('Guidance must be text of up to 2,000 characters.')
++  if (typeof text !== 'string') throw new Error('Guidance must be text.')
 +  return text.trim()
 +}
 +
@@ -366,91 +395,149 @@ index 0000000..bf6ad06
 +      || Object.keys(plan).some(key => !['parent_id', 'donors'].includes(key))) {
 +    throw new Error('Return { parent_id, donors? } for each candidate.')
 +  }
-+  if (!alive(rows).some(row => row.id === plan.parent_id)) throw new Error('The primary parent must be alive.')
-+  const donorIds = plan.donors ?? []
-+  if (!Array.isArray(donorIds) || donorIds.length > 4 || new Set(donorIds).size !== donorIds.length
-+      || donorIds.some(id => id === plan.parent_id || !rows.some(row => row.id === id && merit(row.fitness) > 0))) {
-+    throw new Error('Specify at most four distinct, successfully evaluated donor IDs other than the primary parent.')
++  if (!rows.some(row => row.id === plan.parent_id)) throw new Error('Unknown primary parent ID.')
++  const donors = plan.donors ?? []
++  if (!Array.isArray(donors) || new Set(donors).size !== donors.length
++      || donors.some(id => id === plan.parent_id || !rows.some(row => row.id === id))) {
++    throw new Error('Specify distinct recorded or generated donor IDs other than the primary parent.')
 +  }
-+  return { parent_id: plan.parent_id, donors: donorIds }
++  return { parent_id: plan.parent_id, donors }
 +}
 +
-+function chooseSurvivors(result, pool, maximum) {
-+  if (!Array.isArray(result) || result.length === 0 || result.length > maximum
-+      || new Set(result).size !== result.length || result.some(id => !pool.some(row => row.id === id))) {
-+    throw new Error('survive must return a nonempty list of distinct alive IDs within maxPopulation.')
++function chooseSurvivors(ids, history) {
++  if (!Array.isArray(ids) || new Set(ids).size !== ids.length || ids.some(id => !history.some(row => row.id === id))) {
++    throw new Error('Population membership must be a list of distinct evaluated candidate IDs.')
 +  }
-+  return new Set(result)
++  return new Set(ids)
 +}
 +
-+function scheduleRun(state, root, hooks, invoke) {
++function scheduleRun(state, root, hooks, guest) {
 +  return async (_args, evolve) => {
 +    const population = evolve.population()
-+    const { candidates, maxPopulation, k, task } = await evolve.context()
++    const { candidates, maxPopulation, k, task, budget: start } = await evolve.context()
 +    const { program } = JSON.parse(await readFile(resolve(task, 'task.json'), 'utf8'))
++    state.pendingCandidates ??= {}
 +    if ((await population.rows()).length === 0) {
 +      const baseline = await evolve.copyTask()
 +      await population.append({ id: baseline.id, parent: null, fitness: await evolve.evaluate(baseline), survival: 'yes' })
 +    }
 +
-+    const view = async () => {
++    async function view() {
 +      const history = await population.rows()
-+      return { history, alive: alive(history), budget: (await evolve.context()).budget, k, maxPopulation }
++      const { budget } = await evolve.context()
++      const pending = Object.values(state.pendingCandidates).filter(item => !history.some(row => row.id === item.id))
++      return { history, alive: alive(history), pending, budget, k, maxPopulation,
++        remaining: Math.min(candidates - (budget.used - start.used), budget.remaining) }
 +    }
 +
-+    let used = 0
-+    while (used < candidates) {
++    async function select(feed) {
++      return hooks.select ? (await guest.invoke('select', feed)).result : evolve.select(population)
++    }
++
++    async function generate(raw) {
 +      const feed = await view()
-+      const remaining = Math.min(candidates - used, feed.budget.remaining)
-+      if (!remaining) break
-+      const options = { ...feed, remaining }
-+      const scheduled = hooks.loop ? await invoke('loop', options) : null
-+      const batch = Array.isArray(scheduled) ? scheduled : [scheduled]
-+      if (!batch.length || batch.length > remaining) throw new Error('loop must schedule between 1 and remaining candidates.')
-+      const plans = []
-+      for (const item of batch) {
-+        const selected = item ?? (hooks.select ? await invoke('select', options) : await evolve.select(population))
-+        plans.push(normalizePlan(selected, feed.history))
++      if (feed.remaining <= 0) throw new Error('The candidate budget for this chunk is exhausted.')
++      const known = [...feed.history, ...feed.pending]
++      const { parent_id, donors } = normalizePlan(raw, known)
++      const donorsForPrompt = await Promise.all(donors.map(async id => ({
++        id, fitness: known.find(row => row.id === id).fitness ?? null,
++        source: await readInside(candidatePath(root, id), program),
++      })))
++      const primary = known.find(row => row.id === parent_id)
++      const oneShot = state.nextGuidance
++      const dynamic = hooks.guidance && !oneShot ? guidanceText((await guest.invoke('guidance', {
++        ...feed, primary, donors: donorsForPrompt,
++      })).result) : ''
++      const guidance = oneShot || dynamic
++      const candidate = await evolve.mutate({ parent: parent_id, donorContext: donorsForPrompt, searchGuidance: guidance })
++      const row = { id: candidate.id, parent: parent_id,
++        ...(donors.length ? { donors } : {}),
++        ...(guidance ? { guidance } : {}) }
++      state.pendingCandidates[candidate.id] = row
++      if (oneShot) {
++        state.nextGuidance = ''
++        state.revisions.push({ kind: 'consume_guidance', candidate: candidate.id })
 +      }
-+      for (const { parent_id, donors } of plans) {
-+        const donorsForPrompt = await Promise.all(donors.map(async id => ({
-+          id, fitness: feed.history.find(row => row.id === id).fitness,
-+          source: await readInside(candidatePath(root, id), program),
-+        })))
-+        const fixedParent = feed.history.find(row => row.id === parent_id)
-+        const oneShot = state.nextGuidance
-+        const dynamic = hooks.guidance && !oneShot ? guidanceText(await invoke('guidance', {
-+          ...(await view()), primary: fixedParent, donors: donorsForPrompt,
-+        })) : ''
-+        const guidance = oneShot || dynamic
-+        const candidate = await evolve.mutate({ parent: parent_id, donorContext: donorsForPrompt, searchGuidance: guidance })
-+        if (oneShot) {
-+          state.nextGuidance = ''
-+          state.revisions.push({ kind: 'consume_guidance', candidate: candidate.id })
-+          await save(root, state)
-+        }
-+        const fitness = await evolve.evaluate(candidate)
-+        await population.append({
-+          id: candidate.id, parent: parent_id, fitness, survival: 'yes',
-+          ...(donors.length ? { donors } : {}),
-+          ...(guidance ? { guidance } : {}),
-+        })
-+        used++
-+        const after = await view()
-+        if (after.alive.length >= maxPopulation) {
-+          if (!hooks.survive) {
-+            await evolve.survive(population)
-+          } else {
-+            const survivors = chooseSurvivors(await invoke('survive', after), after.alive, maxPopulation)
-+            await population.write(after.history.map(row => row.survival === 'yes' && !survivors.has(row.id)
-+              ? { ...row, survival: 'no' } : row))
-+          }
-+        }
++      await save(root, state)
++      return row
++    }
++
++    async function evaluate(id) {
++      const existing = (await population.rows()).find(row => row.id === id)
++      if (existing) return existing
++      if (typeof id !== 'string' || !Object.hasOwn(state.pendingCandidates, id)) {
++        throw new Error('Evaluation requires a generated candidate ID.')
++      }
++      const draft = state.pendingCandidates[id]
++      const fitness = await evolve.evaluate({ id, dir: candidatePath(root, id) })
++      const row = { ...draft, fitness, survival: 'yes' }
++      await population.append(row)
++      delete state.pendingCandidates[id]
++      await save(root, state)
++      return row
++    }
++
++    async function setPopulation(ids, feed) {
++      const members = chooseSurvivors(ids, feed.history)
++      await population.write(feed.history.map(row => ({ ...row, survival: members.has(row.id) ? 'yes' : 'no' })))
++      return ids
++    }
++
++    async function survive(feed) {
++      if (!hooks.survive) {
++        await evolve.survive(population)
++        return alive(await population.rows()).map(row => row.id)
++      }
++      return setPopulation((await guest.invoke('survive', feed)).result, feed)
++    }
++
++    async function dispatch(request) {
++      if (!request || typeof request !== 'object') throw new Error('Yield an operation object.')
++      const { op, ...args } = request
++      switch (op) {
++        case 'state': return view()
++        case 'select': return select(await view())
++        case 'generate': return generate(args)
++        case 'evaluate': return evaluate(args.id)
++        case 'survive': return survive(await view())
++        case 'set_population': return setPopulation(args.ids, await view())
++        default: throw new Error('Unknown loop operation: ' + op)
 +      }
 +    }
-+    const rows = await population.rows()
-+    const best = rows.reduce((a, b) => merit(b.fitness) > merit(a.fitness) ? b : a)
-+    return { best_id: best.id, best_fitness: best.fitness, remaining: (await evolve.context()).budget.remaining }
++
++    // Generator loops control operation ordering, including when to inspect feedback or prune.
++    // Existing synchronous loop hooks remain compatible with the upstream candidate cycle.
++    try {
++      while (true) {
++        const feed = await view()
++        if (!feed.remaining && (!hooks.loop || !feed.pending.length)) break
++        let step = hooks.loop ? await guest.invoke('loop', feed) : { result: null }
++        if (step.yielded || step.finished) {
++          let commands = 0
++          while (step.yielded) {
++            evolve.currentRun().signal.throwIfAborted()
++            if (++commands > 1000 + 20 * candidates) throw new Error('Loop exceeded its operation limit.')
++            step = await guest.resumeLoop(await dispatch(step.result))
++          }
++          break
++        }
++        if (!feed.remaining) break
++        const batch = Array.isArray(step.result) ? step.result : [step.result]
++        if (!batch.length || batch.length > feed.remaining) throw new Error('loop must schedule between 1 and remaining candidates.')
++        const plans = []
++        for (const item of batch) plans.push(normalizePlan(item ?? await select(feed), [...feed.history, ...feed.pending]))
++        for (const plan of plans) {
++          await evaluate((await generate(plan)).id)
++          const after = await view()
++          if (after.alive.length >= maxPopulation) await survive(after)
++        }
++      }
++    } finally {
++      if (hooks.loop) guest.closeLoop()
++    }
++    const searched = await view()
++    const best = searched.history.reduce((a, b) => merit(b.fitness) > merit(a.fitness) ? b : a)
++    return { best_id: best.id, best_fitness: best.fitness, remaining: searched.budget.remaining }
 +  }
 +}
 +
@@ -487,10 +574,12 @@ index 0000000..bf6ad06
 +    state.revisions.push({ used: (await budgetReport(root))?.used ?? 0, ...details })
 +    await save(root, state)
 +  }
-+  tool('evolve_define', 'Define JavaScript with return { select(state) { return state.alive[0].id } }. '
-+    + 'Hooks: loop returns one or more parent plans; null entries delegate to selection. Select returns an ID or {parent_id, donors}. '
-+    + 'survive returns retained IDs at the population threshold. V2 may export guidance(state) returning text. '
-+    + 'State exposes history, alive, budget, k and maxPopulation; loop also gets remaining, guidance gets primary and donors. '
++  tool('evolve_define', 'Define JavaScript returning a search plugin object. For full scheduling use *loop(state) and yield '
++    + 'operation objects: {op:"state"}, {op:"select"}, {op:"generate",parent_id,donors?}, {op:"evaluate",id}, '
++    + '{op:"survive"}, or {op:"set_population",ids}. Each yield receives its result. Return to end the chunk. '
++    + 'A plain loop(state) can still return plans for the default generate/evaluate/cull cycle. '
++    + 'Select returns an ID or {parent_id, donors}; survive returns any subset of evaluated IDs including archived candidates. '
++    + 'V2 may export guidance(state) returning text. State exposes history, alive, pending, budget, remaining, k and maxPopulation. '
 +    + 'Hooks share module variables until deactivation or process restart. State also includes a zero-based '
 +    + 'hook turn and shared state.memory, which you can update with JSON to survive restart. '
 +    + 'Hooks run synchronously on copied data. Activate the returned version to use it.', {
@@ -540,7 +629,7 @@ index 0000000..bf6ad06
 +    async (_args, _exec, _paths, state) => inventory(state))
 +  if (variant === 'v2') {
 +    tool('evolve_set_guidance', 'Queue a text direction for the next candidate. Empty text clears it.', {
-+      guidance: field('string', 'Single-candidate direction, up to 2,000 characters.', true),
++      guidance: field('string', 'Single-candidate direction.', true),
 +    }, async (args, _exec, { root }, state) => {
 +      state.nextGuidance = guidanceText(args.guidance)
 +      await revise(root, state, { kind: 'set_guidance', guidance: state.nextGuidance })
@@ -548,12 +637,16 @@ index 0000000..bf6ad06
 +    }, true)
 +  }
 +  tool('evolve_status', 'Read the task statement, active search hooks, budget and official candidate history.', {},
-+    async (_args, _exec, { root, task }, state) => ({
-+      variant, routing: state.routing, revisions: state.revisions.slice(-8), ...inventory(state),
-+      task: await filesOf(task).read('statement.md'),
-+      budget: (await budgetReport(root)) ?? { max: budget, used: 0, remaining: budget },
-+      history: await readPopulation(root),
-+    }))
++    async (_args, _exec, { root, task }, state) => {
++      const history = await readPopulation(root)
++      return {
++        variant, routing: state.routing, revisions: state.revisions.slice(-8), ...inventory(state),
++        task: await filesOf(task).read('statement.md'),
++        budget: (await budgetReport(root)) ?? { max: budget, used: 0, remaining: budget },
++        history,
++        pending: Object.values(state.pendingCandidates ?? {}).filter(item => !history.some(row => row.id === item.id)),
++      }
++    })
 +  tool('evolve_inspect', 'Read the original task source, the fixed evaluator entry point, or a recorded candidate source or evaluation JSON. '
 +    + 'Use evolve_status for complete lineage history.', {
 +    artifact: { type: 'string', required: true, enum: ['source', 'evaluation', 'evaluator'], description: 'Artifact to read.' },
@@ -590,17 +683,32 @@ index 0000000..bf6ad06
 +    }
 +    const hooks = providers(state)
 +    const live = runtimes(root)
-+    async function invoke(slot, input) {
++    function runtime(slot) {
 +      const { version, code } = hooks[slot]
 +      if (!live.has(version)) live.set(version, createPlugin(code, allowed))
++      return live.get(version)
++    }
++    async function storeHookState(version, output, turns) {
++      state.pluginState[version] = { turns, memory: output.memory }
++      await save(root, state)
++      return output
++    }
++    async function invoke(slot, input) {
++      const { version } = hooks[slot]
 +      const checkpoint = state.pluginState[version] ?? { turns: {}, memory: {} }
 +      const turn = checkpoint.turns[slot] ?? 0
-+      const { result, memory } = live.get(version).invoke(slot, { ...input, turn, memory: checkpoint.memory })
-+      state.pluginState[version] = { turns: { ...checkpoint.turns, [slot]: turn + 1 }, memory }
-+      await save(root, state)
-+      return result
++      const output = runtime(slot).invoke(slot, { ...input, turn, memory: checkpoint.memory })
++      return storeHookState(version, output, { ...checkpoint.turns, [slot]: turn + 1 })
 +    }
-+    const dispose = evolve.register('loop', scheduleRun(state, root, hooks, invoke))
++    const guest = {
++      invoke,
++      resumeLoop(value) {
++        const { version } = hooks.loop
++        return storeHookState(version, runtime('loop').resume(value), state.pluginState[version].turns)
++      },
++      closeLoop() { live.get(hooks.loop.version)?.close() },
++    }
++    const dispose = evolve.register('loop', scheduleRun(state, root, hooks, guest))
 +    try {
 +      return await evolve.run({
 +        maxBudget: budget, maxPopulation: DEFAULT_MAX_POPULATION, k: DEFAULT_K, candidates: args.candidates,
@@ -612,10 +720,10 @@ index 0000000..bf6ad06
 +}
 diff --git a/plugins/dsh-evolve-loop/tests/restricted.node.mjs b/plugins/dsh-evolve-loop/tests/restricted.node.mjs
 new file mode 100644
-index 0000000..1a8a9e8
+index 0000000..ce1dd5e
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/tests/restricted.node.mjs
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,185 @@
 +import { strict as assert } from 'node:assert'
 +import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
@@ -696,13 +804,13 @@ index 0000000..1a8a9e8
 +      tools: { register: tool => tools.set(tool.name, tool), guard: callback => assert.equal(callback, restrictedToolGuard) },
 +    }
 +    const evolve = new Evolve(ctx)
-+    installRestrictedTools(ctx, evolve, x => x, { variant, budget: 9 })
++    installRestrictedTools(ctx, evolve, x => x, { variant, budget: 11 })
 +    const options = { provider: 'fixture', model: 'fixed-model', reasoningEffort: 'none' }
 +    const exec = { agent: { options, session: { header: { cwd: task } } } }
 +    function call(name, args = {}) { return tools.get(name).execute(args, exec) }
 +    assert.equal(tools.has('evolve_set_guidance'), variant === 'v2')
 +    await assert.rejects(call('evolve_run', { candidates: 1, max_budget: 900 }), /chunk size/)
-+    assert.deepEqual(await call('evolve_run', { candidates: 1 }), { best_id: 'c000001', best_fitness: 11, remaining: 8 })
++    assert.deepEqual(await call('evolve_run', { candidates: 1 }), { best_id: 'c000001', best_fitness: 11, remaining: 10 })
 +    options.model = 'other-model'
 +    await assert.rejects(call('evolve_run', { candidates: 1 }), /model route/)
 +    options.model = 'fixed-model'
@@ -725,8 +833,8 @@ index 0000000..1a8a9e8
 +      memory: { turns: [[0, 1], [1, 2], [2, 3]], lastSelectionSaw: 3 },
 +    })
 +    // A fresh service instance simulates a DSH restart with the same task state.
-+    installRestrictedTools(ctx, new Evolve(ctx), x => x, { variant, budget: 9 })
-+    assert.deepEqual(await call('evolve_run', { candidates: 3 }), { best_id: 'c000009', best_fitness: 19, remaining: 0 })
++    installRestrictedTools(ctx, new Evolve(ctx), x => x, { variant, budget: 11 })
++    assert.deepEqual(await call('evolve_run', { candidates: 3 }), { best_id: 'c000009', best_fitness: 19, remaining: 2 })
 +    const restored = (await readCheckpoint()).pluginState[def.package_id]
 +    assert.deepEqual(restored.memory.turns, [[0, 1], [1, 2], [2, 3], [3, 1]])
 +    assert.equal(restored.turns.loop, 4)
@@ -743,6 +851,42 @@ index 0000000..1a8a9e8
 +    await call('evolve_deactivate', { plugin_id: def.plugin_id })
 +    assert.deepEqual((await call('evolve_plugins')).providers, {})
 +    assert.equal((await readCheckpoint()).pluginState[def.package_id], undefined)
++    const custom = await call('evolve_define', {
++      name: 'Custom candidate ordering', purpose: 'Archive reuse and deferred evaluation',
++      host_code: `return {
++        *loop(s) {
++          if (s.remaining) {
++            const donors = s.history.slice(2, 9).map(row => row.id)
++            const a = yield { op: 'generate', parent_id: 'c000001', donors }
++            const b = yield { op: 'generate', parent_id: a.id }
++            s.memory.ids = [a.id, b.id]
++            return
++          }
++          yield { op: 'set_population', ids: s.history.map(row => row.id) }
++          const [a,b] = s.memory.ids
++          yield { op: 'evaluate', id: b }
++          yield { op: 'evaluate', id: a }
++          const observed = yield { op: 'state' }
++          if (observed.alive.length !== 12) throw new Error('Unexpected automatic pruning')
++          yield { op: 'survive' }
++        },
++        survive() { return ['c000001', 'c000009'] }
++      }`,
++    })
++    await call('evolve_activate', { plugin_id: custom.plugin_id })
++    assert.deepEqual(await call('evolve_run', { candidates: 2 }), { best_id: 'c000009', best_fitness: 19, remaining: 0 })
++    const pending = await call('evolve_status')
++    assert.equal(pending.history.length, 10)
++    assert.deepEqual(pending.pending.map(row => row.id), ['c000010', 'c000011'])
++    assert.equal(pending.pending[0].donors.length, 7)
++    assert.equal(pending.pending[1].parent, 'c000010')
++    installRestrictedTools(ctx, new Evolve(ctx), x => x, { variant, budget: 11 })
++    assert.deepEqual(await call('evolve_run', { candidates: 1 }), { best_id: 'c000011', best_fitness: 21, remaining: 0 })
++    const finished = await call('evolve_status')
++    assert.deepEqual(finished.pending, [])
++    assert.deepEqual(finished.history.slice(-2).map(row => row.id), ['c000011','c000010'])
++    assert.deepEqual(finished.history.filter(row => row.survival === 'yes').map(row => row.id), ['c000001','c000009'])
++    assert.match(requests[9].prompt[0].text, /"id":"c000008"/)
 +    assert.deepEqual(await readFile(evaluator), evaluatorBefore)
 +    return requests
 +  }
