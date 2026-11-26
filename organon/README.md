@@ -10,4 +10,4 @@ cd organon_upstream
 node --test plugins/dsh-evolve-loop/tests/restricted.node.mjs
 ```
 
-The generated checkout's `REPRODUCTION.md` describes the Linux and Docker setup, including how to select `ORGANON_VARIANT=v1` or `v2`. V1 exposes scheduling, parent selection, and survival policies. V2 also provides a short direction field appended to the fixed Worker task prompt.
+The generated checkout's `REPRODUCTION.md` describes the Linux and Docker setup and the JavaScript hook contract. V1 lets the model write, activate, version and deactivate custom `loop`, `select` and `survive` plugins. V2 also supports single-candidate guidance and a dynamic `guidance` hook. Candidate generation copies one primary parent and includes any explicitly selected donors as reference code.

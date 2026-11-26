@@ -1,10 +1,10 @@
 diff --git a/PROMPT.restricted.md b/PROMPT.restricted.md
 new file mode 100644
-index 0000000..bede88c
+index 0000000..e1b689e
 --- /dev/null
 +++ b/PROMPT.restricted.md
 @@ -0,0 +1 @@
-+Use the fixed candidate budget to improve the best official score for this task. Read the task and current evidence with evolve_status, then run the search in chunks with evolve_run. When the evidence supports a different search organization, use evolve_configure to update scheduling, parent selection, or survival for later chunks. If guidance is available, use it for a concise direction that helps Workers decide which candidate improvements to try. Continue until the budget is used. Report the best candidate and its official score.
++Use the fixed candidate budget to improve the best official score for this task. Read the task and candidate history with evolve_status. Use evolve_inspect to read the task source, candidate source, and official evaluation artifacts. Run the search in chunks with evolve_run. When the evidence supports a change in scheduling, parent selection, or survival, write a JavaScript plugin with evolve_define, activate it with evolve_activate, and check subsequent results. Each candidate has a primary parent and may use designated evaluated donors as references. In V2 you can optionally queue one candidate direction with evolve_set_guidance or implement a dynamic guidance hook. Continue until the budget is used. Report the best candidate and its official score.
 diff --git a/README.md b/README.md
 index fe94d79..f86c62b 100644
 --- a/README.md
@@ -19,31 +19,54 @@ index fe94d79..f86c62b 100644
  Organon runs on the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) 0.1.7 as two plugins and an agent preset, **Evolve Mode**. This repository contains the plugins, the preset, a one-command setup, and the benchmark tasks with their evaluators. The instructions below are written for Linux, with DSH run from a source clone, including inside a Docker container reached over SSH.
 diff --git a/REPRODUCTION.md b/REPRODUCTION.md
 new file mode 100644
-index 0000000..f81ff0e
+index 0000000..247c770
 --- /dev/null
 +++ b/REPRODUCTION.md
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,52 @@
 +# Restricted Organon reproduction
 +
-+V1 and V2 use a fixed candidate generator, evaluator, and evaluation budget. The orchestrator can revise the configuration between chunks of candidates. It reads the task, official scores, survival state and recent lineage through `evolve_status`. It can run another chunk with `evolve_run` and change supported search fields with `evolve_configure`.
++Both versions retain model-authored search plugins. V1 exposes custom scheduling, parent selection and survival functions. V2 adds a one-candidate direction and a dynamic direction function. Both versions share the same Worker, model route, tool permissions, evaluator, and input construction. Start each comparison from a fresh copy of the same task with matching model settings and budget.
 +
-+| Field | Choices |
++## Modifier tools
++
++- `evolve_status` exposes the task statement, official candidate history, active hooks and remaining budget.
++- `evolve_inspect` exposes the task program and evaluator entry point or a recorded candidate's source and public evaluation JSON. The files are read-only. Post-run private evaluation stays outside the search session.
++- `evolve_define` takes `name`, `purpose`, and `host_code`. Pass an existing `plugin_id` to create a new version. `evolve_activate` starts a chosen version and `evolve_deactivate` restores the previous provider. `evolve_plugins` shows the active hooks. Changes take effect between `evolve_run` chunks.
++
++## JavaScript hook contract
++
++The source body returns an object exporting any subset of the permitted functions. Each function receives a private JSON snapshot with `history`, `alive`, `budget`, `k`, and `maxPopulation`. Functions execute synchronously in a fresh VM context with a 250 ms limit. Carry decisions across calls through the recorded history or update the plugin between chunks. The host performs candidate allocation, Worker invocation, scoring, history recording and budget enforcement.
++
++| Function | Contract |
 +| --- | --- |
-+| `loop` | `sequential` uses the latest population for each attempt. `cohort` chooses a group's parents before evaluating any member of that group. |
-+| `batch_size` | 1–8 parent selections per cohort. Attempts still run and consume budget individually. |
-+| `select` | `fitness_proportional`, `best`, `uniform`, or `tournament` (three draws). |
-+| `survive` | `top_k` or `recent_with_elite`. |
-+| `guidance` | V2 only. Update the optional Worker direction, up to 2,000 characters. An empty string clears it. |
++| `loop(state)` | Schedule one plan or an array of plans for the next step. Each item is a primary ID, an object `{parent_id, donors?}`, or `null` to invoke selection. The input supplies `remaining` for the chunk. The policy is called again after the plans run. |
++| `select(state)` | Select one alive primary candidate by ID, or return `{parent_id, donors}`. If there is no custom selector the upstream fitness-proportional selector is used. |
++| `survive(state)` | When the population reaches the fixed threshold, return a nonempty list of retained IDs from the alive population. The upstream top-k rule is the default. |
++| `guidance(state)` | V2 only. Return up to 2,000 characters of direction for the current candidate, or an empty string. The input additionally supplies `primary` metadata and the selected `donors`. |
 +
-+The default search is sequential, fitness-proportional and top-k, using the upstream population thresholds. The fixed Worker receives the default persona and task instruction, including its parent's fitness. In V2 the trusted prompt builder appends the current direction to that instruction. The Worker tool allowlist consists of confined file operations. The orchestrator can call the three search tools listed above. Dynamic JavaScript and generic delegation are unavailable in the restricted service.
++For example, a model can define a custom batch schedule and selector:
 +
-+The variant, model route, reasoning configuration and search revisions are saved to `run/search-policy.json`. Use equivalent fresh task copies and the same backend, model, reasoning and candidate budget across variants. Within a run a route change is rejected. The public protocol and each task's evaluator files come from the original Organon kit.
++```js
++return {
++  loop(state) {
++    return Array(Math.min(state.remaining, 2)).fill(null)
++  },
++  select(state) {
++    const parent = state.alive.at(-1)
++    return { parent_id: parent.id }
++  }
++}
++```
++
++The Worker starts from the primary parent's workspace. A fixed prompt builder adds the nominated donors' IDs, official fitness and program text as reference data. Donors are optional, distinct and limited to four. To override the dynamic guidance on one candidate in V2, call `evolve_set_guidance`. That text is consumed after candidate allocation and Worker execution. The dynamic hook supplies guidance again for the following candidate. The default Worker persona and task instructions remain the base prompt. The Worker uses the same confined file tools across variants.
++
++`run/search-policy.json` records the source code, versions, active hooks, fixed model settings and changes. `run/population.jsonl` records the primary parent, donors, supplied guidance and official fitness. The VM interface passes data only. Run the harness in the dedicated experiment environment for guest-code isolation at the process and OS level.
 +
 +## Launch
 +
-+Use the author kit's Linux environment, with a source clone of DeepSeek Harness `dsh-v0.1.7-rc.1`, supported Node, pnpm, Docker and the Python evaluator dependencies. Run `bash setup.sh` from this checkout. It packages the current restricted evolve-loop source and installs the original candidate-builder archive.
++Use the Linux and Docker dependencies from the author kit. `bash setup.sh` installs the restricted evolve-loop from the current source and the original candidate-builder archive with DeepSeek Harness `dsh-v0.1.7-rc.1`.
 +
-+Start the dedicated DSH process from its clone with the prepared profile. Set `ORGANON_VARIANT=v1` or `ORGANON_VARIANT=v2` before starting the process, and set `ORGANON_BUDGET` to the fixed cap (default 100). For example, from the DSH checkout after setup:
++From the DSH checkout, after setup:
 +
 +```bash
 +export ORGANON_VARIANT=v1
@@ -51,9 +74,7 @@ index 0000000..f81ff0e
 +PATH="$DSH_HOME/benchmarks/venv/bin:$PATH" pnpm dsh web --no-open
 +```
 +
-+In the web UI start an **Evolve Mode** session in a fresh copy of the task folder. Use the same model settings for both variants. Send the English prompt in [PROMPT.restricted.md](PROMPT.restricted.md). Test V2 in a separate process and task copy. Compare `run/search-policy.json`, `run/population.jsonl` and `run/evals/`.
-+
-+Run the dependency-free local policy and worker-contract tests with `node --test plugins/dsh-evolve-loop/tests/restricted.node.mjs` from this checkout. They use a stub Worker and evaluator subprocess.
++Run V2 with `ORGANON_VARIANT=v2` and a separate task copy. Start an **Evolve Mode** session in the task directory and send [PROMPT.restricted.md](PROMPT.restricted.md). Use `node --test plugins/dsh-evolve-loop/tests/restricted.node.mjs` for the dependency-free tests, which use a stub Worker and evaluator subprocess.
 diff --git a/plugins/dsh-evolve-loop/cordis.patch.yml b/plugins/dsh-evolve-loop/cordis.patch.yml
 index e81f7e5..3dbd097 100644
 --- a/plugins/dsh-evolve-loop/cordis.patch.yml
@@ -79,53 +100,36 @@ index abc3e13..290addf 100644
    },
 diff --git a/plugins/dsh-evolve-loop/presets/restricted.patch.yml b/plugins/dsh-evolve-loop/presets/restricted.patch.yml
 new file mode 100644
-index 0000000..399a47e
+index 0000000..728dab8
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/presets/restricted.patch.yml
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,26 @@
 +- insert:
 +    - id: preset-evolve
 +      name: '@deepseek-ai/dsh-agent-preset'
 +      config:
 +        id: evolve
 +        name: Evolve Mode
-+        description: Organize a fixed-budget evolutionary search using validated policies.
++        description: Organize a fixed-budget evolutionary search with runtime search plugins.
 +        plugins:
 +          - id: persona
 +            name: '@deepseek-ai/dsh-persona'
 +            config:
 +              prefix: |-
 +                You organize one evolutionary search for the task in this workspace.
-+                Read the task and official search history with evolve_status. Run candidates in chunks
-+                using evolve_run. Use scores and parent history to decide when changing parent selection,
-+                scheduling, or survival is worthwhile. Set those policies with evolve_configure.
-+                If the configuration tool exposes guidance, use it to give the Worker a concise research
-+                direction for subsequent candidates. Workers implement one candidate each. The evaluator
-+                scores each attempt under the same protocol and the fixed candidate budget.
++                Use evolve_status for the task and candidate history. Read the task source and official
++                evaluation artifacts with evolve_inspect. Run candidates in chunks with evolve_run.
++                Diagnose the search from the observed evidence. Use evolve_define and evolve_activate
++                to write and activate your own JavaScript scheduling (loop), parent selection (select),
++                or population pruning (survive) hooks. Use evolve_deactivate to roll back a change.
++                Supply one primary parent per candidate and optionally nominate scored donors.
++                If V2 is active, use evolve_set_guidance for the next candidate or a guidance hook for
++                dynamic candidate direction. The Worker implements one candidate and the fixed evaluator
++                scores that attempt under the same protocol and budget.
 +          - id: tool-fs
 +            name: '@deepseek-ai/dsh-tool-fs'
 +          - id: tool-fs-search
 +            name: '@deepseek-ai/dsh-tool-fs-search'
-diff --git a/plugins/dsh-evolve-loop/src/evolve.js b/plugins/dsh-evolve-loop/src/evolve.js
-index 98b2cf2..f4a4677 100644
---- a/plugins/dsh-evolve-loop/src/evolve.js
-+++ b/plugins/dsh-evolve-loop/src/evolve.js
-@@ -172,6 +172,7 @@ export class Evolve {
-       maxPopulation = DEFAULT_MAX_POPULATION,
-       k = DEFAULT_K,
-       candidates,
-+      searchGuidance,
-     } = args ?? {}
- 
-     requirePositiveInteger('maxBudget', maxBudget)
-@@ -192,6 +193,7 @@ export class Evolve {
-       k,
-       maxPopulation,
-       candidates,
-+      searchGuidance,
-     })
- 
-     try {
 diff --git a/plugins/dsh-evolve-loop/src/index.js b/plugins/dsh-evolve-loop/src/index.js
 index 157d398..d930223 100644
 --- a/plugins/dsh-evolve-loop/src/index.js
@@ -156,139 +160,103 @@ index 157d398..d930223 100644
  
    ctx.tools.register(defineTool({
      name: 'evolve_run',
+diff --git a/plugins/dsh-evolve-loop/src/policy-code.js b/plugins/dsh-evolve-loop/src/policy-code.js
+new file mode 100644
+index 0000000..d095e7d
+--- /dev/null
++++ b/plugins/dsh-evolve-loop/src/policy-code.js
+@@ -0,0 +1,35 @@
++/** Run a guest search policy with data-only inputs and a synchronous time bound. */
++import { createContext, Script } from 'node:vm'
++
++export function executePlugin(code, allowed, slot, state) {
++  if (typeof code !== 'string' || !code.trim() || code.length > 32_768) {
++    throw new Error('host_code must contain 1–32,768 characters of JavaScript.')
++  }
++  const input = JSON.stringify(JSON.stringify(state ?? null))
++  const script = new Script(
++    '"use strict"; (() => {\n'
++    + ' const policy = (() => {\n' + code + '\n})();\n'
++    + ' if (policy === null || typeof policy !== "object" || Array.isArray(policy)) '
++    + 'throw new Error("Return an object with search policy functions.");\n'
++    + ' const keys = Object.keys(policy);\n'
++    + ' if (!keys.length || keys.some(key => !' + JSON.stringify(allowed)
++    + '.includes(key) || typeof policy[key] !== "function")) '
++    + 'throw new Error("Only enabled search hooks can be exported: " + ' + JSON.stringify(allowed.join(', ')) + ');\n'
++    + (slot === undefined ? 'return JSON.stringify(keys);\n'
++      : ' const result = policy[' + JSON.stringify(slot) + '](JSON.parse(' + input + '));\n'
++        + ' if (result === undefined || (result && typeof result.then === "function")) '
++        + 'throw new Error("Return a synchronous JSON value.");\n'
++        + ' return JSON.stringify(result);\n')
++    + '})()',
++    { filename: 'organon-policy.js' },
++  )
++  const realm = createContext(Object.create(null), {
++    codeGeneration: { strings: false, wasm: false },
++    microtaskMode: 'afterEvaluate',
++  })
++  const result = script.runInContext(realm, { timeout: 250 })
++  if (typeof result !== 'string' || result.length > 65_536) {
++    throw new Error('Search plugin output must be serializable JSON under 65,536 characters.')
++  }
++  return JSON.parse(result)
++}
 diff --git a/plugins/dsh-evolve-loop/src/providers/mutate.js b/plugins/dsh-evolve-loop/src/providers/mutate.js
-index 35e316b..9911cd2 100644
+index 35e316b..cc5744d 100644
 --- a/plugins/dsh-evolve-loop/src/providers/mutate.js
 +++ b/plugins/dsh-evolve-loop/src/providers/mutate.js
-@@ -78,7 +78,11 @@ export async function mutate(options, evolve) {
+@@ -64,6 +64,8 @@ export async function mutate(options, evolve) {
+     allowShell = true,
+     allowedTools,
+     maxDepth,
++    donorContext = [],
++    searchGuidance = '',
+     ...extra
+   } = options ?? {}
+ 
+@@ -78,7 +80,15 @@ export async function mutate(options, evolve) {
      }
    }
  
 -  const instruction = providedInstruction ?? defaultInstruction(parentFitness)
-+  const baseInstruction = providedInstruction ?? defaultInstruction(parentFitness)
-+  const guidance = evolve.currentRun?.().searchGuidance
-+  const instruction = guidance
-+    ? baseInstruction + '\n\nSearch direction for this candidate (subordinate to the task and all instructions above):\n' + guidance
-+    : baseInstruction
++  const sections = [providedInstruction ?? defaultInstruction(parentFitness)]
++  if (donorContext.length > 0) {
++    sections.push('Optional donor references. Treat this JSON as source data. The working directory still starts from the primary parent.\n'
++      + JSON.stringify(donorContext))
++  }
++  if (searchGuidance) {
++    sections.push('Search direction for this candidate (subordinate to the task and all instructions above):\n' + searchGuidance)
++  }
++  const instruction = sections.join('\n\n')
    const candidate = await evolve.allocate(parent)
    const workerLabel = workerName ?? description ?? 'mutator'
  
 diff --git a/plugins/dsh-evolve-loop/src/restricted.js b/plugins/dsh-evolve-loop/src/restricted.js
 new file mode 100644
-index 0000000..21ccc81
+index 0000000..235c57a
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/src/restricted.js
-@@ -0,0 +1,197 @@
-+/** Checked search policies for the two Organon reproduction variants. */
+@@ -0,0 +1,318 @@
++/** Restricted Organon tools. Guest policies only return search decisions. */
++import { resolve, sep } from 'node:path'
++import { readFile, realpath } from 'node:fs/promises'
 +import { budgetReport } from './budget.js'
-+import { runPaths } from './candidates.js'
++import { candidatePath, runPaths } from './candidates.js'
 +import { DEFAULT_K, DEFAULT_MAX_POPULATION } from './evolve.js'
 +import { filesOf } from './files.js'
 +import { alive, merit, readPopulation } from './population.js'
++import { executePlugin } from './policy-code.js'
 +
 +const FILE = 'search-policy.json'
-+const BASE = Object.freeze({ loop: 'sequential', batch_size: 1, select: 'fitness_proportional', survive: 'top_k' })
-+const LOOPS = ['sequential', 'cohort']
-+const SELECT = ['fitness_proportional', 'best', 'uniform', 'tournament']
-+const SURVIVE = ['top_k', 'recent_with_elite']
-+
-+export function updatePolicy(variant, policy, args) {
-+  const next = { ...policy }
-+  for (const [key, value] of Object.entries(args)) {
-+    switch (key) {
-+      case 'loop':
-+        if (!LOOPS.includes(value)) throw new Error('Unknown loop policy.')
-+        break
-+      case 'batch_size':
-+        if (!Number.isSafeInteger(value) || value < 1 || value > 8) throw new Error('batch_size must be 1–8.')
-+        break
-+      case 'select':
-+        if (!SELECT.includes(value)) throw new Error('Unknown parent selection policy.')
-+        break
-+      case 'survive':
-+        if (!SURVIVE.includes(value)) throw new Error('Unknown survival policy.')
-+        break
-+      case 'guidance':
-+        if (variant !== 'v2') throw new Error('Guidance is available only in V2.')
-+        if (typeof value !== 'string' || value.length > 2000) throw new Error('Guidance must be at most 2000 characters.')
-+        break
-+      default:
-+        throw new Error('Unknown search policy field: ' + key)
-+    }
-+    next[key] = key === 'guidance' ? value.trim() : value
-+  }
-+  return next
-+}
-+
-+const SEARCH_TOOLS = new Set(['evolve_run', 'evolve_status', 'evolve_configure'])
-+const FILE_TOOLS = new Set(['read', 'write', 'edit', 'glob', 'grep', 'read_image'])
++const CONFIGURATION_TOOLS = ['evolve_define', 'evolve_activate', 'evolve_deactivate', 'evolve_plugins',
++  'evolve_run', 'evolve_status', 'evolve_inspect', 'evolve_set_guidance']
++const WORKER_FILE_TOOLS = new Set(['read', 'write', 'edit', 'glob', 'grep', 'read_image'])
 +
 +export function restrictedToolGuard({ name, agent }) {
 +  const worker = agent?.session?.header?.origin === 'subagent'
-+  if (!(worker ? FILE_TOOLS : SEARCH_TOOLS).has(name)) {
++  if (!(worker ? WORKER_FILE_TOOLS.has(name) : CONFIGURATION_TOOLS.includes(name))) {
 +    return 'This tool is unavailable in the restricted Organon preset.'
 +  }
-+}
-+
-+function selectPolicy(policy) {
-+  return async population => {
-+    const pool = alive(await population.rows())
-+    const draw = () => pool[Math.floor(Math.random() * pool.length)]
-+    const better = (a, b) => merit(b.fitness) > merit(a.fitness) ? b : a
-+    if (pool.length === 0) throw new Error('No alive parent candidate.')
-+    if (policy === 'best') return pool.reduce(better).id
-+    if (policy === 'tournament') return [draw(), draw(), draw()].reduce(better).id
-+    return draw().id
-+  }
-+}
-+
-+async function keepRecentWithElite(population, evolve) {
-+  const { k } = await evolve.context()
-+  const rows = await population.rows()
-+  const pool = alive(rows)
-+  if (pool.length <= k) return
-+  const best = pool.reduce((a, b) => merit(b.fitness) > merit(a.fitness) ? b : a)
-+  const ids = new Set([best.id, ...pool.filter(row => row.id !== best.id).reverse().slice(0, k - 1).map(row => row.id)])
-+  await population.write(rows.map(row => row.survival === 'yes' && !ids.has(row.id)
-+    ? { ...row, survival: 'no' } : row))
-+}
-+
-+function cohortLoop(width) {
-+  return async (_args, evolve) => {
-+    const population = evolve.population()
-+    const { maxPopulation, candidates } = await evolve.context()
-+    if ((await population.rows()).length === 0) {
-+      const baseline = await evolve.copyTask()
-+      await population.append({ id: baseline.id, parent: null, fitness: await evolve.evaluate(baseline), survival: 'yes' })
-+    }
-+    let remaining = candidates
-+    while (remaining > 0) {
-+      const { budget } = await evolve.context()
-+      const size = Math.min(remaining, budget.remaining, width)
-+      if (size === 0) break
-+      const parents = []
-+      // Freeze parent selection for this cohort; every attempt still spends a slot.
-+      for (let i = 0; i < size; i++) parents.push(await evolve.select(population))
-+      for (const parent of parents) {
-+        const candidate = await evolve.mutate({ parent })
-+        const fitness = await evolve.evaluate(candidate)
-+        await population.append({ id: candidate.id, parent, fitness, survival: 'yes' })
-+      }
-+      if (alive(await population.rows()).length >= maxPopulation) await evolve.survive(population)
-+      remaining -= size
-+    }
-+    const rows = await population.rows()
-+    const best = rows.reduce((a, b) => merit(b.fitness) > merit(a.fitness) ? b : a)
-+    return { best_id: best.id, best_fitness: best.fitness, remaining: (await evolve.context()).budget.remaining }
-+  }
-+}
-+
-+async function readState(root, variant) {
-+  const text = await filesOf(root).read(FILE)
-+  if (text === undefined) return { variant, policy: { ...BASE, ...(variant === 'v2' ? { guidance: '' } : {}) }, revisions: [] }
-+  const state = JSON.parse(text)
-+  if (state.variant !== variant) throw new Error('Use a separate task workspace for each Organon variant.')
-+  return state
 +}
 +
 +function routingOf(agent) {
@@ -302,86 +270,297 @@ index 0000000..21ccc81
 +  }
 +}
 +
++async function readState(root, variant) {
++  const text = await filesOf(root).read(FILE)
++  if (text === undefined) return { variant, plugins: [], active: [], revisions: [], nextGuidance: '' }
++  const state = JSON.parse(text)
++  if (state.variant !== variant) throw new Error('Use a separate task workspace for each Organon variant.')
++  if (!Array.isArray(state.plugins) || !Array.isArray(state.active)) {
++    throw new Error('Use a fresh task workspace for the runtime-plugin baseline.')
++  }
++  return state
++}
++
++async function save(root, state) {
++  await filesOf(root).write(FILE, JSON.stringify(state, null, 2) + '\n')
++}
++
++function providers(state) {
++  const hooks = {}
++  for (const active of state.active) {
++    const plugin = pluginById(state, active.plugin_id)
++    const version = packageById(plugin, active.package_id)
++    for (const slot of version.slots) hooks[slot] = { plugin: plugin.id, version: version.id, code: version.code }
++  }
++  return hooks
++}
++
++function pluginById(state, id) {
++  const plugin = state.plugins.find(item => item.id === id)
++  if (!plugin) throw new Error('Unknown plugin: ' + id)
++  return plugin
++}
++
++function packageById(plugin, id) {
++  const version = id ? plugin.versions.find(item => item.id === id) : plugin.versions.at(-1)
++  if (!version) throw new Error('Unknown plugin version: ' + id)
++  return version
++}
++
++function inventory(state) {
++  const hooks = providers(state)
++  return {
++    plugins: state.plugins.map(plugin => ({
++      id: plugin.id, versions: plugin.versions.map(({code, ...version}) => version),
++    })),
++    active: state.active,
++    providers: Object.fromEntries(Object.entries(hooks).map(([slot, hook]) => [
++      slot, { plugin_id: hook.plugin, package_id: hook.version },
++    ])),
++  }
++}
++
++async function readInside(root, filename) {
++  if (typeof filename !== 'string' || !filename || filename === '.') throw new Error('Invalid program path.')
++  const boundary = await realpath(root)
++  const target = await realpath(resolve(boundary, filename))
++  if (!target.startsWith(boundary + sep)) throw new Error('Only the nominated program inside the task is readable.')
++  return readFile(target, 'utf8')
++}
++
++function guidanceText(text) {
++  if (typeof text !== 'string' || text.length > 2000) throw new Error('Guidance must be text of up to 2,000 characters.')
++  return text.trim()
++}
++
++function normalizePlan(raw, rows) {
++  const plan = typeof raw === 'string' ? { parent_id: raw } : raw
++  if (!plan || typeof plan !== 'object' || Array.isArray(plan)
++      || Object.keys(plan).some(key => !['parent_id', 'donors'].includes(key))) {
++    throw new Error('Return { parent_id, donors? } for each candidate.')
++  }
++  if (!alive(rows).some(row => row.id === plan.parent_id)) throw new Error('The primary parent must be alive.')
++  const donorIds = plan.donors ?? []
++  if (!Array.isArray(donorIds) || donorIds.length > 4 || new Set(donorIds).size !== donorIds.length
++      || donorIds.some(id => id === plan.parent_id || !rows.some(row => row.id === id && merit(row.fitness) > 0))) {
++    throw new Error('Specify at most four distinct, successfully evaluated donor IDs other than the primary parent.')
++  }
++  return { parent_id: plan.parent_id, donors: donorIds }
++}
++
++function chooseSurvivors(result, pool, maximum) {
++  if (!Array.isArray(result) || result.length === 0 || result.length > maximum
++      || new Set(result).size !== result.length || result.some(id => !pool.some(row => row.id === id))) {
++    throw new Error('survive must return a nonempty list of distinct alive IDs within maxPopulation.')
++  }
++  return new Set(result)
++}
++
++function scheduleRun(state, allowed, root, hooks) {
++  const invoke = (slot, input) => executePlugin(hooks[slot].code, allowed, slot, input)
++  return async (_args, evolve) => {
++    const population = evolve.population()
++    const { candidates, maxPopulation, k, task } = await evolve.context()
++    const { program } = JSON.parse(await readFile(resolve(task, 'task.json'), 'utf8'))
++    if ((await population.rows()).length === 0) {
++      const baseline = await evolve.copyTask()
++      await population.append({ id: baseline.id, parent: null, fitness: await evolve.evaluate(baseline), survival: 'yes' })
++    }
++
++    const view = async () => {
++      const history = await population.rows()
++      return { history, alive: alive(history), budget: (await evolve.context()).budget, k, maxPopulation }
++    }
++
++    let used = 0
++    while (used < candidates) {
++      const feed = await view()
++      const remaining = Math.min(candidates - used, feed.budget.remaining)
++      if (!remaining) break
++      const options = { ...feed, remaining }
++      const scheduled = hooks.loop ? invoke('loop', options) : null
++      const batch = Array.isArray(scheduled) ? scheduled : [scheduled]
++      if (!batch.length || batch.length > remaining) throw new Error('loop must schedule between 1 and remaining candidates.')
++      const plans = []
++      for (const item of batch) {
++        const selected = item ?? (hooks.select ? invoke('select', options) : await evolve.select(population))
++        plans.push(normalizePlan(selected, feed.history))
++      }
++      for (const { parent_id, donors } of plans) {
++        const donorsForPrompt = await Promise.all(donors.map(async id => ({
++          id, fitness: feed.history.find(row => row.id === id).fitness,
++          source: await readInside(candidatePath(root, id), program),
++        })))
++        const fixedParent = feed.history.find(row => row.id === parent_id)
++        const oneShot = state.nextGuidance
++        const dynamic = hooks.guidance && !oneShot ? guidanceText(invoke('guidance', {
++          ...(await view()), primary: fixedParent, donors: donorsForPrompt,
++        })) : ''
++        const guidance = oneShot || dynamic
++        const candidate = await evolve.mutate({ parent: parent_id, donorContext: donorsForPrompt, searchGuidance: guidance })
++        if (oneShot) {
++          state.nextGuidance = ''
++          state.revisions.push({ kind: 'consume_guidance', candidate: candidate.id })
++          await save(root, state)
++        }
++        const fitness = await evolve.evaluate(candidate)
++        await population.append({
++          id: candidate.id, parent: parent_id, fitness, survival: 'yes',
++          ...(donors.length ? { donors } : {}),
++          ...(guidance ? { guidance } : {}),
++        })
++        used++
++        const after = await view()
++        if (after.alive.length >= maxPopulation) {
++          if (!hooks.survive) {
++            await evolve.survive(population)
++          } else {
++            const survivors = chooseSurvivors(invoke('survive', after), after.alive, maxPopulation)
++            await population.write(after.history.map(row => row.survival === 'yes' && !survivors.has(row.id)
++              ? { ...row, survival: 'no' } : row))
++          }
++        }
++      }
++    }
++    const rows = await population.rows()
++    const best = rows.reduce((a, b) => merit(b.fitness) > merit(a.fitness) ? b : a)
++    return { best_id: best.id, best_fitness: best.fitness, remaining: (await evolve.context()).budget.remaining }
++  }
++}
++
 +export function installRestrictedTools(ctx, evolve, defineTool, { variant, budget }) {
 +  if (!['v1', 'v2'].includes(variant)) throw new Error('ORGANON_VARIANT must be v1 or v2.')
 +  if (!Number.isSafeInteger(budget) || budget < 1) throw new Error('ORGANON_BUDGET must be a positive integer.')
++  const allowed = ['loop', 'select', 'survive', ...(variant === 'v2' ? ['guidance'] : [])]
 +  ctx.tools.guard(restrictedToolGuard)
++  const field = (type, description, required = false) => ({ type, description, required })
 +  let busy = false
-+  async function exclusive(fn) {
-+    if (busy) throw new Error('Wait for the current Organon operation to finish.')
-+    busy = true
-+    try { return await fn() } finally { busy = false }
++  function tool(name, description, parameters, fn, exclusive = false) {
++    ctx.tools.register(defineTool({
++      name, description, parameters,
++      async execute(args, exec) {
++        if (exclusive && busy) throw new Error('Wait for the current Organon operation to finish.')
++        if (exclusive) busy = true
++        try {
++          const paths = runPaths(exec.agent)
++          return await fn(args, exec, paths, await readState(paths.root, variant))
++        } finally {
++          if (exclusive) busy = false
++        }
++      },
++      output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
++    }))
 +  }
-+  const tool = (name, description, parameters, execute) => ctx.tools.register(defineTool({
-+    name, description, parameters, execute,
-+    output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-+  }))
-+  tool('evolve_configure', 'Update the search organization for subsequent chunks. Fields omitted keep their values.',
-+    {
-+      loop: { type: 'string', enum: LOOPS, description: 'Sequential or fixed-parent cohort scheduling.' },
-+      batch_size: { type: 'integer', description: 'Parent cohort width, 1–8, used by the cohort loop.' },
-+      select: { type: 'string', enum: SELECT, description: 'Policy for choosing alive parents.' },
-+      survive: { type: 'string', enum: SURVIVE, description: 'Keep top k, or keep the elite and recent candidates.' },
-+      ...(variant === 'v2' ? { guidance: { type: 'string', description: 'Optional candidate direction appended to the fixed Worker task. An empty string clears the previous guidance.' } } : {}),
-+    },
-+    (args, exec) => exclusive(async () => {
-+      const { root } = runPaths(exec.agent)
-+      const state = await readState(root, variant)
-+      const previous = state.policy
-+      state.policy = updatePolicy(variant, previous, args)
-+      const used = (await budgetReport(root))?.used ?? 0
-+      state.revisions.push({ used, before: previous, after: state.policy })
-+      await filesOf(root).write(FILE, JSON.stringify(state, null, 2) + '\n')
-+      return state.policy
++  async function revise(root, state, details) {
++    state.revisions.push({ used: (await budgetReport(root))?.used ?? 0, ...details })
++    await save(root, state)
++  }
++  tool('evolve_define', 'Define JavaScript with return { select(state) { return state.alive[0].id } }. '
++    + 'Hooks: loop returns one or more parent plans; null entries delegate to selection. Select returns an ID or {parent_id, donors}. '
++    + 'survive returns retained IDs at the population threshold. V2 may export guidance(state) returning text. '
++    + 'State exposes history, alive, budget, k and maxPopulation; loop also gets remaining, guidance gets primary and donors. '
++    + 'Hooks run synchronously on copied data. Activate the returned version to use it.', {
++    name: field('string', 'Plugin name.', true),
++    purpose: field('string', 'Expected effect and evidence.', true),
++    host_code: field('string', 'JavaScript body returning the hook object.', true),
++    plugin_id: field('string', 'Existing plugin ID when defining a new version.'),
++  }, async (args, _exec, { root }, state) => {
++    const slots = executePlugin(args.host_code, allowed)
++    const plugin = args.plugin_id ? pluginById(state, args.plugin_id) : { id: 'evo-' + (state.plugins.length + 1), versions: [] }
++    if (!args.plugin_id) state.plugins.push(plugin)
++    const id = plugin.id + '-v' + (plugin.versions.length + 1)
++    plugin.versions.push({ id, name: args.name, purpose: args.purpose, slots, code: args.host_code })
++    await revise(root, state, { kind: 'define', plugin_id: plugin.id, package_id: id })
++    return { plugin_id: plugin.id, package_id: id, slots }
++  }, true)
++  tool('evolve_activate', 'Activate a defined plugin version between chunks.', {
++    plugin_id: field('string', 'Plugin ID.', true), package_id: field('string', 'Defaults to the latest version.'),
++  }, async (args, _exec, { root }, state) => {
++    const plugin = pluginById(state, args.plugin_id)
++    const version = packageById(plugin, args.package_id)
++    executePlugin(version.code, allowed)
++    state.active = state.active.filter(active => active.plugin_id !== plugin.id)
++    const entry = { plugin_id: plugin.id, package_id: version.id }
++    state.active.push(entry)
++    await revise(root, state, { kind: 'activate', ...entry })
++    return { ...entry, providers: inventory(state).providers }
++  }, true)
++  tool('evolve_deactivate', 'Deactivate a plugin and restore the previous provider for its hooks.', {
++    plugin_id: field('string', 'Plugin ID.', true),
++  }, async (args, _exec, { root }, state) => {
++    pluginById(state, args.plugin_id)
++    state.active = state.active.filter(active => active.plugin_id !== args.plugin_id)
++    await revise(root, state, { kind: 'deactivate', plugin_id: args.plugin_id })
++    return inventory(state)
++  }, true)
++  tool('evolve_plugins', 'List defined versions and currently active hooks.', {},
++    async (_args, _exec, _paths, state) => inventory(state))
++  if (variant === 'v2') {
++    tool('evolve_set_guidance', 'Queue a text direction for the next candidate. Empty text clears it.', {
++      guidance: field('string', 'Single-candidate direction, up to 2,000 characters.', true),
++    }, async (args, _exec, { root }, state) => {
++      state.nextGuidance = guidanceText(args.guidance)
++      await revise(root, state, { kind: 'set_guidance', guidance: state.nextGuidance })
++      return { guidance: state.nextGuidance }
++    }, true)
++  }
++  tool('evolve_status', 'Read the task statement, active search hooks, budget and official candidate history.', {},
++    async (_args, _exec, { root, task }, state) => ({
++      variant, routing: state.routing, revisions: state.revisions.slice(-8), ...inventory(state),
++      task: await filesOf(task).read('statement.md'),
++      budget: (await budgetReport(root)) ?? { max: budget, used: 0, remaining: budget },
++      history: await readPopulation(root),
 +    }))
-+  tool('evolve_status', 'Read the task statement, search settings, budget and official candidate history.',
-+    {}, async (_args, exec) => {
-+      const { root, task } = runPaths(exec.agent)
-+      const state = await readState(root, variant)
-+      const history = await readPopulation(root)
-+      return {
-+        variant, policy: state.policy, routing: state.routing, revisions: state.revisions.slice(-8),
-+        task: await filesOf(task).read('statement.md'),
-+        budget: (await budgetReport(root)) ?? { max: budget, used: 0, remaining: budget },
-+        population: history.filter(row => row.survival === 'yes'),
-+        recent: history.slice(-20),
-+      }
-+    })
-+  tool('evolve_run', 'Run up to the requested number of candidates using the current policy and fixed evaluator.',
-+    { candidates: { type: 'integer', required: true, description: 'Maximum candidates in this chunk.' } },
-+    (args, exec) => exclusive(async () => {
-+      if (Object.keys(args).some(key => key !== 'candidates')) throw new Error('Only the chunk size may be supplied.')
-+      const { root } = runPaths(exec.agent)
-+      const state = await readState(root, variant)
-+      const { policy } = state
-+      const routing = routingOf(exec.agent)
-+      if (state.routing && Object.keys(routing).some(key => state.routing[key] !== routing[key])) {
-+        throw new Error('The model route or reasoning options differ from the start of this run.')
-+      }
-+      if (!state.routing) {
-+        state.routing = routing
-+        await filesOf(root).write(FILE, JSON.stringify(state, null, 2) + '\n')
-+      }
-+      const disposers = []
-+      try {
-+        if (policy.loop === 'cohort') disposers.push(evolve.register('loop', cohortLoop(policy.batch_size)))
-+        if (policy.select !== 'fitness_proportional') disposers.push(evolve.register('select', selectPolicy(policy.select)))
-+        if (policy.survive !== 'top_k') disposers.push(evolve.register('survive', keepRecentWithElite))
-+        return await evolve.run({
-+          maxBudget: budget, maxPopulation: DEFAULT_MAX_POPULATION, k: DEFAULT_K,
-+          candidates: args.candidates, searchGuidance: policy.guidance,
-+        }, exec)
-+      } finally {
-+        disposers.reverse().forEach(dispose => dispose())
-+      }
-+    }))
++  tool('evolve_inspect', 'Read the original task source, the fixed evaluator entry point, or a recorded candidate source or evaluation JSON. '
++    + 'Use evolve_status for complete lineage history.', {
++    artifact: { type: 'string', required: true, enum: ['source', 'evaluation', 'evaluator'], description: 'Artifact to read.' },
++    candidate_id: field('string', 'Recorded candidate ID; omit for the original task source.'),
++  }, async (args, _exec, { root, task }) => {
++    const id = args.candidate_id
++    if (id !== undefined && (!/^c\d{6}$/.test(id) || !(await readPopulation(root)).some(row => row.id === id))) {
++      throw new Error('Unknown evaluated candidate ID.')
++    }
++    if (args.artifact === 'evaluation' && id !== undefined) {
++      const content = await readInside(resolve(root, 'evals'), id + '.json')
++      return { evaluation: JSON.parse(content) }
++    }
++    if (args.artifact === 'evaluator' && id === undefined) {
++      return { source: await readInside(task, 'evaluator/evaluator.py') }
++    }
++    if (args.artifact !== 'source') throw new Error('Use an ID for an evaluation and omit the ID for the evaluator.')
++    const { program } = JSON.parse(await readInside(task, 'task.json'))
++    return { program, source: await readInside(id ? candidatePath(root, id) : task, program) }
++  })
++  tool('evolve_run', 'Run up to the requested number of candidates, using active hooks and the fixed evaluator.', {
++    candidates: field('integer', 'Maximum candidates in this chunk.', true),
++  }, async (args, exec, { root }, state) => {
++    if (Object.keys(args).some(key => key !== 'candidates') || !Number.isSafeInteger(args.candidates) || args.candidates < 1) {
++      throw new Error('Supply only a positive candidate chunk size.')
++    }
++    const routing = routingOf(exec.agent)
++    if (state.routing && Object.keys(routing).some(key => state.routing[key] !== routing[key])) {
++      throw new Error('The model route or reasoning options differ from the start of this run.')
++    }
++    if (!state.routing) {
++      state.routing = routing
++      await save(root, state)
++    }
++    const dispose = evolve.register('loop', scheduleRun(state, allowed, root, providers(state)))
++    try {
++      return await evolve.run({
++        maxBudget: budget, maxPopulation: DEFAULT_MAX_POPULATION, k: DEFAULT_K, candidates: args.candidates,
++      }, exec)
++    } finally {
++      dispose()
++    }
++  }, true)
 +}
 diff --git a/plugins/dsh-evolve-loop/tests/restricted.node.mjs b/plugins/dsh-evolve-loop/tests/restricted.node.mjs
 new file mode 100644
-index 0000000..905a164
+index 0000000..74ddc7a
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/tests/restricted.node.mjs
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,135 @@
 +import { strict as assert } from 'node:assert'
 +import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
@@ -390,29 +569,32 @@ index 0000000..905a164
 +import { test } from 'node:test'
 +import { Evolve } from '../src/evolve.js'
 +import { defaultInstruction } from '../src/providers/mutate.js'
-+import { installRestrictedTools, restrictedToolGuard, updatePolicy } from '../src/restricted.js'
++import { installRestrictedTools, restrictedToolGuard } from '../src/restricted.js'
++import { executePlugin } from '../src/policy-code.js'
 +
 +const FIXTURE = fileURLToPath(new URL('./fixtures/task/', import.meta.url))
 +
-+test('configuration validates search-only keys and version-gates guidance', () => {
-+  const defaults = { select: 'best', survive: 'top_k' }
-+  assert.throws(() => updatePolicy('v1', defaults, { guidance: 'Try another direction.' }), /only in V2/)
-+  for (const key of ['model', 'evaluator', 'system_prompt', 'mutate', 'allowedTools', 'host_code']) {
-+    assert.throws(() => updatePolicy('v2', defaults, { [key]: 'override' }), /Unknown search policy field/)
++test('guest hooks use only allowed exports and data-only input', () => {
++  const allowed = ['loop','select','survive']
++  for (const key of ['guidance', 'model', 'evaluate', 'mutate']) {
++    assert.throws(() => executePlugin('return { ' + key + '() {} }', allowed), /Only enabled/)
 +  }
-+  assert.throws(() => updatePolicy('v2', defaults, { batch_size: 9 }), /1–8/)
-+  assert.throws(() => updatePolicy('v2', defaults, { loop: 'run_js' }), /Unknown loop/)
-+  assert.equal(updatePolicy('v2', defaults, { guidance: '  Prefer small edits. ' }).guidance, 'Prefer small edits.')
++  assert.throws(() => executePlugin('while (true) {}', allowed), /timed out/)
++  const state = { budget: { used: 2 } }
++  const output = executePlugin('return { loop(s) { s.budget.used = 900; return [typeof process, typeof require] } }',
++    allowed, 'loop', state)
++  assert.deepEqual(output, ['undefined', 'undefined'])
++  assert.equal(state.budget.used, 2)
 +})
 +
 +test('orchestrator and Worker keep separate operation sets', () => {
 +  const worker = { session: { header: { origin: 'subagent' } } }
-+  for (const name of ['write', 'bash', 'plugin_manager', 'candidate-builder', 'evolve_activate']) {
++  for (const name of ['write', 'bash', 'plugin_manager', 'candidate-builder']) {
 +    assert.ok(restrictedToolGuard({ name }))
 +  }
-+  assert.equal(restrictedToolGuard({ name: 'evolve_configure' }), undefined)
++  assert.equal(restrictedToolGuard({ name: 'evolve_activate' }), undefined)
 +  assert.equal(restrictedToolGuard({ name: 'edit', agent: worker }), undefined)
-+  assert.ok(restrictedToolGuard({ name: 'evolve_configure', agent: worker }))
++  assert.ok(restrictedToolGuard({ name: 'evolve_define', agent: worker }))
 +  assert.ok(restrictedToolGuard({ name: 'bash', agent: worker }))
 +})
 +
@@ -460,34 +642,50 @@ index 0000000..905a164
 +      tools: { register: tool => tools.set(tool.name, tool), guard: callback => assert.equal(callback, restrictedToolGuard) },
 +    }
 +    const evolve = new Evolve(ctx)
-+    installRestrictedTools(ctx, evolve, x => x, { variant, budget: 3 })
++    installRestrictedTools(ctx, evolve, x => x, { variant, budget: 9 })
 +    const options = { provider: 'fixture', model: 'fixed-model', reasoningEffort: 'none' }
 +    const exec = { agent: { options, session: { header: { cwd: task } } } }
 +    function call(name, args = {}) { return tools.get(name).execute(args, exec) }
-+    assert.deepEqual([...tools.keys()], ['evolve_configure', 'evolve_status', 'evolve_run'])
-+    assert.equal('guidance' in tools.get('evolve_configure').parameters, variant === 'v2')
++    assert.equal(tools.has('evolve_set_guidance'), variant === 'v2')
 +    await assert.rejects(call('evolve_run', { candidates: 1, max_budget: 900 }), /chunk size/)
-+    assert.deepEqual(await call('evolve_run', { candidates: 1 }), { best_id: 'c000001', best_fitness: 11, remaining: 2 })
++    assert.deepEqual(await call('evolve_run', { candidates: 1 }), { best_id: 'c000001', best_fitness: 11, remaining: 8 })
 +    options.model = 'other-model'
 +    await assert.rejects(call('evolve_run', { candidates: 1 }), /model route/)
 +    options.model = 'fixed-model'
-+    const guidance = variant === 'v2' ? { guidance: 'Prioritize small parameter changes.' } : {}
-+    await call('evolve_configure', { loop: 'cohort', batch_size: 2, select: 'best', survive: 'recent_with_elite', ...guidance })
-+    assert.deepEqual(await call('evolve_run', { candidates: 2 }), { best_id: 'c000003', best_fitness: 13, remaining: 0 })
++    const code = 'return { '
++      + 'loop(s) { return Array(Math.min(s.remaining, 3)).fill(null) }, '
++      + 'select(s) { return { parent_id: s.alive.at(-1).id, donors: [s.history[0].id] } }, '
++      + 'survive(s) { return [s.alive.at(-1).id] }'
++      + (variant === 'v2' ? ', guidance(s) { return "Use branch " + s.primary.id }' : '')
++      + ' }'
++    const def = await call('evolve_define', { name: 'Learned policy', purpose: 'Exercise custom hooks', host_code: code })
++    assert.deepEqual((await call('evolve_plugins')).providers, {})
++    await call('evolve_activate', { plugin_id: def.plugin_id })
++    if (variant === 'v2') await call('evolve_set_guidance', { guidance: 'Prioritize small parameter changes.' })
++    assert.deepEqual(await call('evolve_run', { candidates: 8 }), { best_id: 'c000009', best_fitness: 19, remaining: 0 })
 +    const status = await call('evolve_status')
-+    assert.deepEqual(status.recent.map(row => row.parent), [null, 'c000000', 'c000001', 'c000001'])
++    assert.deepEqual(status.history.slice(2,5).map(row => row.parent), ['c000001', 'c000001', 'c000001'])
++    assert.deepEqual(status.history.filter(r => r.survival === 'yes').map(r => r.id), ['c000009'])
 +    assert.equal(status.revisions[0].used, 1)
 +    assert.equal(status.routing.model, 'fixed-model')
++    assert.deepEqual((await call('evolve_inspect', { artifact: 'evaluation', candidate_id: 'c000002' })).evaluation, { fitness: 12 })
++    assert.match((await call('evolve_inspect', { artifact: 'source' })).source, /VALUE = 10/)
++    assert.equal((await call('evolve_inspect', { artifact: 'evaluator' })).source, evaluatorBefore.toString())
++    await assert.rejects(call('evolve_inspect', { artifact: 'evaluation', candidate_id: '../other' }), /Unknown/)
++    await call('evolve_deactivate', { plugin_id: def.plugin_id })
++    assert.deepEqual((await call('evolve_plugins')).providers, {})
 +    assert.deepEqual(await readFile(evaluator), evaluatorBefore)
 +    return requests
 +  }
 +  try {
 +    const v1 = await exercise('v1')
 +    const v2 = await exercise('v2')
-+    assert.equal(v1[1].prompt[0].text, defaultInstruction(11))
++    assert.ok(v1[1].prompt[0].text.startsWith(defaultInstruction(11)))
++    assert.match(v1[1].prompt[0].text, /"id":"c000000"/)
 +    assert.equal(v1[0].prompt[0].text, v2[0].prompt[0].text)
 +    assert.ok(v2[1].prompt[0].text.startsWith(defaultInstruction(11) + '\n\n'))
 +    assert.ok(v2[1].prompt[0].text.endsWith('Prioritize small parameter changes.'))
++    assert.ok(v2[2].prompt[0].text.endsWith('Use branch c000001'))
 +    for (let i = 0; i < v1.length; i++) {
 +      assert.equal(v1[i].persona, v2[i].persona)
 +      assert.equal(v1[i].agentOptions, undefined)
@@ -499,7 +697,7 @@ index 0000000..905a164
 +  }
 +})
 diff --git a/setup.sh b/setup.sh
-index 8fb1fbc..ff73046 100644
+index 8fb1fbc..07b5f19 100644
 --- a/setup.sh
 +++ b/setup.sh
 @@ -2,7 +2,7 @@
@@ -556,8 +754,8 @@ index 8fb1fbc..ff73046 100644
  ' "$PROFILE_DIR/package.json"
 -grep -q "evolve_activate" "$PROFILE_DIR/node_modules/dsh-evolve-loop/src/runtime.js" \
 -  || fail "dsh-evolve-loop is not the kit version (no runtime tools found)"
-+grep -q "evolve_configure" "$PROFILE_DIR/node_modules/dsh-evolve-loop/src/restricted.js" \
-+  || fail "dsh-evolve-loop is missing the restricted configuration tool"
++grep -q "evolve_define" "$PROFILE_DIR/node_modules/dsh-evolve-loop/src/restricted.js" \
++  || fail "dsh-evolve-loop is missing the restricted plugin tools"
  node -e '
    const patch = require(process.argv[1]).dsh?.bundle?.patch ?? []
 -  if (!patch.includes("./presets/evolve.patch.yml")) { console.error("setup: dsh-evolve-loop does not declare the Evolve preset"); process.exit(1) }
