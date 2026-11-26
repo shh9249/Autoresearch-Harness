@@ -5,8 +5,340 @@ index 71e7908..5049f79 100644
 @@ -1 +1,2 @@
  Improve the solution for the task in this folder by orchestrating and improving the search process. Fitness is the score given by the task's evaluator, and the total budget is 100 candidates. Run evolve_run in small chunks rather than using the full budget at once. Between chunks, analyze the results and determine which part or mechanism of the search is limiting progress, stalling, underperforming, or could be made more effective. Update and improve that specific search mechanism, then run another small chunk and repeat this process. Make improvements whenever the search stalls or when the run data suggests that some part of the search strategy could be better. Do not focus on directly solving the task yourself; your role is to orchestrate, diagnose, and improve the search strategy so that the search can discover better solutions. Do not use the web, do not search for existing solutions, and do not give any subagent the option to use the web or search externally for solutions.
 +Experiment scope (takes precedence over the generic search skills): read the task, candidate sources, public evaluation files and history. Change the search by registering native loop, select or survive providers. Check evolve_status: if its provider stacks include guidance, you may also append candidate direction text. Keep the worker, evaluator, models, tools and material assembly fixed. Use the registered evolve tools for search changes and the file tools for inspection. Workers implement the candidates.
+diff --git a/plugins/dsh-evolve-loop/presets/evolve.patch.yml b/plugins/dsh-evolve-loop/presets/evolve.patch.yml
+index f33bfb6..aab6bc2 100644
+--- a/plugins/dsh-evolve-loop/presets/evolve.patch.yml
++++ b/plugins/dsh-evolve-loop/presets/evolve.patch.yml
+@@ -18,7 +18,7 @@
+       config:
+         id: evolve
+         name: Evolve Mode
+-        description: A self-improving search agent. Everything creator mode can do, plus the tools to run a candidate search and revise its own search strategy while the run is in progress.
++        description: A search modifier that inspects evidence and updates scoped Organon providers.
+         order: 5
+         plugins:
+           - id: persona
+@@ -32,27 +32,12 @@
+ 
+                 **How the search works, and what your job is.** The search starts as an evolutionary one. It keeps a population of candidate solutions. Each round, it picks promising candidates as parents, produces variations of them, measures every variation with the official evaluator, and keeps the better ones. No single step has to be brilliant. The strength comes from many independent variations and honest measurement, repeated until the measurements show what works.
+ 
+-                **Your job is to run that process, not to be one of its variations.** Workers produce the variations: each one improves a single candidate in its own directory. You design the mechanisms that decide which parents are used and what directions workers explore; those mechanisms launch the attempts, measure what comes back, record it, and cull. The search runs through `evolve_run`: every candidate is created, scored and recorded inside an `evolve_run` call, and the mechanisms you design take effect through it. As results accumulate, you can improve how the search works. Your instruments are the tools (`evolve_run`, which runs the search loop, and the `evolve` service, whose loop, select, mutate, evaluate and survive providers you can replace), the skills (`orchestrating-the-search` for the loop, `improving-the-search-strategy` for designing and adapting the strategy), and the runtime tools that change the search while it runs (`evolve_define`, `evolve_activate`, `evolve_deactivate`, `evolve_plugins`).
++                Workers implement one candidate in their assigned directory. Your role is to read the task, candidate sources, official evaluations and population history; diagnose a search bottleneck; and revise search organization through the evolve runtime tools.
+ 
+-                **You do not write, design, or look up a solution to the task.** Doing that replaces many measured attempts with one guess, and it takes away the variation that selection needs. What works is learned from this run: from the scores, the candidates, and what the workers report.
++                Start with evolve_status and the orchestrating-the-search skill. V1 permits native loop, select and survive providers. A guidance stack in evolve_status identifies V2, which also accepts candidate direction text. The loop can schedule parallel generation, delayed evaluation and survival; a selector can revisit archived candidates or nominate ordered donor references. The host copies the primary parent and constructs the worker materials.
+ 
+-                You can read the harness you run on. Its composition is Cordis: every capability is a plugin row, and an agent preset is one declaration of rows mounted for a single session. You change your own search strategy during the run with the runtime tools: `evolve_define` records a dynamic plugin whose host code registers `evolve` providers, `evolve_activate` starts it, `evolve_deactivate` stops it. These plugins belong to this session only and disappear when DSH restarts. `cordis_inspect_list` and `cordis_inspect_query` read the exact runtime APIs before you write such code.
++                Run evolve_run in chunks under the same candidate budget. Use improving-the-search-strategy and writing-search-plugins before defining a provider. Between chunks, define, activate or deactivate plugins and compare the resulting official outcomes. The worker, model, tool suite, material builder, scoring protocol and task infrastructure are fixed.
+ 
+-                Two planes decide where an edit belongs. The HOST composition holds the registries and anything shared across sessions — persistence, the sandbox and approval stack, the model route, the subagent registry and its backends. An AGENT PRESET holds what one session contributes to those registries: its tools, its persona, its prompt sections. A persistent change to the profile — a new bundle, a new or overridden preset — is installed with `plugin_manager` and affects every session in the profile; a search change for this run never needs it.
+-
+-                Some things do not change, whatever else you build:
+-
+-                - The task's evaluator is fixed: `evaluator/`, its settings in `task.json`, and the instances, test data and judges it scores with. How a candidate is scored is never modifiable.
+-                - A candidate's official score is the score the task's evaluator gives it, run the way the default evaluate step runs it. Any other measurement is a development measurement, never an official score.
+-                - On an ALE-Bench task, the benchmark's final result is a private evaluation of the best candidate on hidden test cases, run after the search is over. It is not in the task at all, and plays no part in the search.
+-                - The `evolve` service's `allocate`, and `copyTask` for the baseline, are the only operations that can create a candidate. A directory you create yourself is not a candidate, and may not be scored as one, recorded in the population, or returned as the final solution.
+-                - Allocating a candidate spends one unit of a fixed budget, permanently. A failed worker, an abandoned candidate, or one later dropped from the population refunds nothing.
+-                - Only the regions between the `#EVOLVE_START` and `#EVOLVE_END` markers that ship with the baseline may change. Everything else in a candidate is fixed scaffolding.
+-                - A candidate is finished once it has an official score and has been added to the population. Its directory must not change again, and further work on that line starts from a newly allocated child.
+-
+-                Everything else about the search is yours. The mechanism that chooses parents, what survives, how improvement is carried out, what you measure and how you aggregate it for your own decisions, how much you evaluate and in what order, what extra data you generate for yourself — all of it is starting policy, and replacing it is what this preset is for rather than a deviation from it.
+-
+-                Load the `editing-cordis-compositions` skill before writing or changing a composition.
+           - id: agent-instructions
+             name: '@deepseek-ai/dsh-agent-instructions'
+             config:
+@@ -175,13 +160,11 @@
+               searchTimeoutMs: 60000
+           - id: tool-cordis
+             name: '@deepseek-ai/dsh-tool-cordis'
+-          # The shipped creator skills (composition editing, plugin development)
+-          # and this bundle's own search skills.
++          # Search-provider skills for this experiment.
+           - id: skill-filesystem
+             name: '@deepseek-ai/dsh-skill-filesystem'
+             config:
+               customSkillDirs:
+-                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+                 - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('dsh-evolve-loop/package.json')), 'skills')
+           - id: tool-skill
+             name: '@deepseek-ai/dsh-tool-skill'
+diff --git a/plugins/dsh-evolve-loop/skills/improving-the-search-strategy/SKILL.md b/plugins/dsh-evolve-loop/skills/improving-the-search-strategy/SKILL.md
+index c3a285f..21d8c52 100644
+--- a/plugins/dsh-evolve-loop/skills/improving-the-search-strategy/SKILL.md
++++ b/plugins/dsh-evolve-loop/skills/improving-the-search-strategy/SKILL.md
+@@ -15,131 +15,12 @@ Ask what in the search process could explain the pattern. Are promising parents
+ 
+ Choose a change you can connect to the evidence, and consider its cost against the remaining budget. Say what you expect the change to affect, then examine the next chunk for that effect. If the evidence is too thin to choose well, gather more observations before changing the strategy.
+ 
+-## Choose how the search should proceed
++## Choose a mechanism
+ 
+-The default select → mutate → evaluate → record → survive → repeat loop is a starting strategy. Use your diagnosis to decide what the remaining attempts need to accomplish and which parts of the search are worth revising.
++Use `loop` to change scheduling, batching and evaluation order. Use `select` to choose a primary parent and optional donor references, including archived candidates. Use `survive` to manage membership, reactivate a lineage, or maintain diversity. Register a native asynchronous function; a closure can carry counters across chunks. Use the run file store for longer-lived strategy notes.
+ 
+-For example, you may change:
++V2 additionally supports a direction for an individual candidate or a dynamic `guidance` function. Check for the guidance stack in `evolve_status`. A direction can describe the weakness a worker should investigate. The host supplies the worker prompt, candidate materials and official evaluator.
+ 
+-* **How the search loop runs:** React to each result when the next choice depends on it, or compare batches before narrowing directions. Maintain separate lineages, expand a search tree , restart from an earlier candidate with lessons retained, shift between exploration and refinement or others, or use another search process.
+-* **How candidates are produced:** Refinement, repair, redesign, fresh starts, or crossover between candidates, guided by worker directions, prompts, and evaluation findings.
+-* **How candidates are chosen:** Which parents or search lines receive another attempt, using scores, novelty, complementary strengths, or past productivity. Parents are always chosen by a selection mechanism, never picked by hand. Possible mechanisms include tournament selection, weighted sampling, rank-based selection, novelty- or diversity-aware selection, and bandit policies.
+-* **How candidates are managed:** Survival, diversity, archives, niches, islands, migration, restarts, and whether weaker candidates remain available as stepping stones.
+-* **Who does the work:** Worker roles, models, tools, permissions, context, and how workers collaborate. You may create tools or skills when they help workers or the orchestrator.
+-* **How the search learns:** Which measurements and worker reports it keeps, what lessons it extracts, and how they reach later attempts. Memory may be specific to a candidate or lineage, or shared across the run, through prompts, Markdown notes, reports, or structured records.
+-* **How work is coordinated:** Which steps run sequentially or in parallel, how workers hand off context, and when planning, review, or verification occurs.
+-* **How resources are used:** Time, compute, models, and the remaining candidate budget, including when to explore and when to refine promising results.
++## Test the diagnosis
+ 
+-These are examples, not an exhaustive list. Let the run's evidence guide what you change, including parts of the search not named here. Keep the fixed boundaries below.
+-
+-## Preserve the fixed boundaries
+-
+-Improving the search does not permit changing what defines a valid solution or a valid result.
+-
+-You must not change:
+-
+-* the task's evaluator (`evaluator/`) or its settings (`task.json`);
+-* the instances and test data the evaluator scores with;
+-* the definition of official fitness;
+-* the candidate budget, or the operations that create candidates — `allocate` and `copyTask`;
+-* the allowed editable regions of candidate solutions;
+-* an already recorded candidate, whose recorded score must continue to correspond to exactly the code that was evaluated.
+-
+-Never create a candidate directory yourself. A directory that `allocate` or `copyTask` did not create is not a candidate, and may not be scored as one, recorded in the population, or returned as the final solution.
+-
+-Worker reports, diagnostic checks, and other search signals may guide future attempts. Record a candidate's fitness only from the unchanged official evaluator, and choose the final best from those recorded official scores.
+-
+-A change that bypasses these boundaries has not improved the search; it has invalidated the run.
+-
+-## Put the strategy into practice
+-
+-Implement the change your diagnosis calls for. You may revise a provider, create a tool or skill, change how workers are used, or coordinate these parts in a different workflow. Inspect the behavior and interfaces of any runtime component before changing it.
+-
+-Change the search at runtime with the evolve runtime tools: `evolve_define` records a dynamic plugin, `evolve_activate` starts it or switches it to a newer version, `evolve_deactivate` stops or removes it, and `evolve_plugins` lists what this session has defined. Read the exact runtime APIs with `cordis_inspect_list` and `cordis_inspect_query` before writing code.
+-
+-Load the `cordis-plugin-development` skill when you need to know how Cordis plugins are written. Its bundle and Plugin Manager workflow is for persistent changes to the whole profile; a search change for this run goes through the evolve runtime tools instead.
+-
+-Load the `editing-cordis-compositions` skill when the strategy requires changing an agent preset or a composition.
+-
+-### The current `evolve` runtime interface
+-
+-`evolve_run` runs the search through the `evolve` service. The service comes from the `dsh-evolve-loop` plugin, installed in the DSH profile — not in the harness checkout — at `${DSH_HOME:-$HOME/.dsh}/profiles/<profile>/node_modules/dsh-evolve-loop/`, with the service in `src/evolve.js` and the default providers in `src/providers/`.
+-
+-The current service exposes five provider slots, each filled by one active provider:
+-
+-| slot | default provider | method | returns |
+-| --- | --- | --- | --- |
+-| `loop` | `evolve-loop` | `run(args, evolve)` | anything; the default returns `{ best_id, best_fitness, remaining }` |
+-| `select` | `fitness-proportional` | `select(population, evolve)` | the parent's candidate id |
+-| `mutate` | `candidate-builder` | `mutate({ parent }, evolve)` | the new candidate `{ id, dir }`, after a worker has worked on it |
+-| `evaluate` | `python-subprocess` | `evaluate(candidate, evolve)` | the candidate's fitness, a number |
+-| `survive` | `top-k` | `survive(population, evolve)` | nothing; it rewrites the survival flags |
+-
+-Every method receives the service as `evolve`. These operations on it are fixed, and a provider may call them — but only while `evolve_run` is executing:
+-
+-- `allocate(parentId)` — creates the next candidate as a full copy of the parent and spends one budget unit; returns `{ id, dir }`, and refuses when the budget is used up.
+-- `copyTask()` — creates the baseline `c000000`; returns `{ id, dir }`.
+-- `population()` — the run's population file: `rows()`, `append(row)`, `write(rows)`.
+-- `files` — a run-scoped file store for search state: `resolve(path)`, `write(path, text)`, `append(path, text)`, `read(path)` (undefined when absent), `list(dir)`, `exists(path)`, `remove(path)`. Paths are relative to the run directory (`run/`) and cannot escape it.
+-- `context()` — `{ task, root, k, maxPopulation, candidates, budget: { max, used, remaining } }`.
+-- `spawnWorker(dir, prompt, options)` — starts one worker confined to `dir` and waits for it; returns `{ text, stopReason }`. `options` may set `label`, `description`, `persona`, `model`, `allowedTools` and `maxDepth`. Workers never get a shell (`bash`/`pwsh`), whatever the options say. Leave `maxDepth` unset: a value of 0 stops the worker from starting at all, and the candidate stays an unchanged copy of its parent.
+-
+-A loop runs the other steps through the service, which calls whichever provider is active in that slot: `evolve.select(population)`, `evolve.mutate({ parent })`, `evolve.evaluate(candidate)` and `evolve.survive(population)`.
+-
+-**`allocate` and `mutate` are not interchangeable.** `allocate(parentId)` only creates the candidate directory. `mutate({ parent })` creates it and also has a worker work on it: the default mutate calls `allocate(parent)`, then `spawnWorker` with the default prompt, and returns only after that worker has finished, so a loop that calls `mutate` several times runs those workers one after another. A loop that starts its own workers — several at once, or with its own prompts — must create its candidates with `allocate`. Calling `mutate` and then `spawnWorker` on the same candidate runs two workers on it, one after the other, for a single budget unit.
+-
+-Persist search state (scores, reports, logs, digests) with `evolve.files`, never with `node:fs` or `ctx.fs`. The dynamic sandbox has no `node:fs`, and `ctx.fs` is policy-fenced: a dynamic plugin calls `writeText` without a per-call sandbox policy, so the fence resolves the deployment default policy (`workspace-write`, workspace root `process.cwd()`) and a write under the run directory fails with `FS_SANDBOX_DENIED`. The `evolve.files` handle runs in the plugin's host half, which has no such fence.
+-
+-Before replacing anything, look at what is active: `evolve.listProviders()` returns the active provider's name for every slot, and `evolve.getProvider(slot)` returns the provider itself. The default mutate exposes `defaultInstruction(parentFitness)` and `defaultPersona()`, so you can read exactly what workers are told today.
+-
+-### Replacing a provider
+-
+-A dynamic plugin's host code returns a plugin object. Inject the `evolve` service and register the provider inside `ctx.effect`, so that stopping the plugin removes it:
+-
+-```js
+-return {
+-  name: 'tournament-select',
+-  inject: ['evolve'],
+-  apply(ctx) {
+-    ctx.effect(() => ctx.evolve.register('select', {
+-      name: 'tournament',
+-      async select(population, evolve) {
+-        const alive = (await population.rows()).filter(row => row.survival === 'yes')
+-        // choose one of `alive` and return its id
+-      },
+-    }))
+-  },
+-}
+-```
+-
+-1. `evolve_define` with this code as `host_code` returns `{ plugin_id, package_id, warnings }`. Warnings flag code that cannot register a provider as expected; fix them before activating.
+-2. `evolve_activate` with the `plugin_id` starts it. Its result lists the slots whose provider stack `changed`; an activation that changed nothing comes back with a warning, and a failure comes back with its message and stack.
+-3. To change it, call `evolve_define` again with the same `plugin_id` and the new code, then `evolve_activate`: the running version is switched to the new one.
+-4. `evolve_deactivate` stops it, and the provider that was active before comes back; `remove: true` also deletes every version.
+-
+-The newest registration for a slot is the active one, and the next `evolve_run` call uses it. Both activation and deactivation are refused while `evolve_run` is executing. The plugins belong to this session and disappear when DSH restarts.
+-
+-### Rules to preserve when changing providers
+-
+-The service checks the budget when `allocate` is called, but it does not validate every result or population record a provider produces. Keep these rules when replacing providers:
+-
+-- **Create each new candidate with `allocate(parentId)`.** Only the baseline comes from `copyTask()`. A replacement mutate must return the candidate it just allocated, not an existing or already recorded candidate.
+-- **Record only candidates created by `allocate` or `copyTask()`.** If a provider writes population rows directly, keep each row tied to the candidate that was evaluated. Do not change a candidate after recording its score.
+-- **Use the unchanged official evaluator for fitness.** An evaluate provider must return its finite numeric result. The service does not reject a missing or non-numeric value before it enters the population.
+-- **Keep each worker confined to its candidate directory.** `spawnWorker` accepts `options.confine`, but do not use it to widen where a worker can write.
+-
+-### Default behavior to account for
+-
+-- **The default loop** evaluates the baseline if needed, then repeats selection, mutation, evaluation, recording, and survival while budget remains and the call's `candidates` limit has not been reached. A replacement loop must manage its own progress and stopping conditions. If it repeats without allocating, the budget does not advance.
+-- **The default select, survive, and loop** rank candidates by `merit(fitness)` from `population.js`. Positive fitness ranks by its value, zero ranks last, and negative fitness ranks by `1/|fitness|`.
+-- **The default mutate** runs one worker per call and waits for it to finish, and it discards the worker's final reply. If later attempts need worker reports, a replacement mutate can save them with `evolve.files`.
+-
+-## Learn from the next results
+-
+-Run another chunk and compare its results with what you expected the change to improve. Look at official scores, evaluation findings, which directions received attempts, and how much budget they used. A single strong or weak candidate may not tell you whether the strategy helped.
+-
+-Keep, revise, or remove the change based on what you learn. Carry useful findings into later search decisions and worker context.
+-
+-## Build support for the search
+-
+-If the run reveals a gap in how you inspect results, retain lessons, coordinate work, or make search decisions, you may create or improve a tool, plugin, skill, prompt, or memory record to address it. Start from a concrete need shown by the search, then use later chunks to see whether the change helps you make better decisions or produce better candidates.
++Keep the candidate budget fixed. After a chunk, compare the affected lineages, the official gains and failures, and the number of attempts spent. Continue, revise or deactivate the change based on that evidence. Load `writing-search-plugins` for the provider contract and lifecycle.
+diff --git a/plugins/dsh-evolve-loop/skills/orchestrating-the-search/SKILL.md b/plugins/dsh-evolve-loop/skills/orchestrating-the-search/SKILL.md
+index 2f48674..7c12f9f 100644
+--- a/plugins/dsh-evolve-loop/skills/orchestrating-the-search/SKILL.md
++++ b/plugins/dsh-evolve-loop/skills/orchestrating-the-search/SKILL.md
+@@ -99,35 +99,17 @@ An interrupted call may leave a candidate allocated but not recorded; its budget
+ 
+ ## Directing workers
+ 
+-The default `mutate` provider gives a worker one copied candidate and its parent's fitness, with a general instruction to improve it. A tailored direction is optional. When results across candidates show a specific weakness or opportunity, you can register a `mutate` provider that gives workers more focused instructions; `improving-the-search-strategy` explains how.
+-
+-### Choosing a worker direction
+-
+-A direction tells the worker what to investigate or improve. The worker chooses the approach and writes the code. These are examples, not a menu:
+-
+-- **Explore:** Look beyond the kinds of approaches tried so far.
+-- **Exploit:** Refine a strength shown by a promising parent.
+-- **Repair:** Address a failure reported by the parent's evaluation.
+-- **Generalize:** Improve weak cases while preserving strong ones.
+-- **Balance:** Seek a better trade-off when a gain in one metric hurts another.
+-- **Rethink:** Question a parent's approach when several descendants have stalled.
+-- **Salvage a failure:** Pursue the promising part of an unsuccessful candidate while addressing what made it fail.
+-
+-Choose or invent a direction from this run's evidence. You may name task constraints, observed behavior, and evaluation results. Do not supply solution code or prescribe the algorithm, steps, techniques, data structures, or parameter values. Before the first run, when there is no search history, leave the direction open or ask for different approaches without saying how.
+-
+-### Giving the worker context
+-
+-A worker has no memory of this conversation. Its candidate directory gives it the task and parent solution; provide any other context this attempt needs deliberately. That might include evaluation failures, the parent’s score, lessons from its lineage, or findings from the wider run. You may carry those findings forward through prompts, saved worker replies, notes, structured records, or another form of memory. Keep only what helps future attempts, and decide which workers should receive it.
++Choose one primary parent and optionally an ordered list of distinct donor IDs. The host constructs the reference material. V2 can append a direction for this candidate, such as exploring a recurring failure in its lineage. The worker chooses and implements the specific change. Load `writing-search-plugins` for the exact call signatures.
+ 
+ ### Keeping attempts valid
+ 
+ Keep each worker's writable workspace inside its allocated candidate directory. Only the solution region between `#EVOLVE_START` and `#EVOLVE_END` may change; the statement and other copied task files remain fixed. The task evaluator and `task.json` stay outside the candidate directory.
+ 
+-One allocated candidate is one complete solution attempt. A worker may reason about alternatives, but must not produce or test several complete solutions inside one candidate directory and submit only the best. Trying another complete solution requires another allocated candidate and spends another budget unit. The current budget counter tracks allocated candidate directories, so a custom `mutate` provider must preserve this rule.
++One allocated candidate is one complete solution attempt. A worker may reason about alternatives, but must not produce or test several complete solutions inside one candidate directory and submit only the best. Trying another complete solution requires another allocated candidate and spends another budget unit. The current budget counter tracks allocated candidate directories, including attempts generated from a custom loop.
+ 
+ ## Official scores come from the task's evaluator
+ 
+-The default evaluate already follows these rules. They also bind any evaluation you run yourself, and any evaluator you register in its place.
++Use the fixed evaluate provider and record the fitness it returns.
+ 
+ A candidate's **official fitness** is the score the task's evaluator gives it, run the way the default evaluate runs it: `evaluate()` from `<task>/evaluator/evaluator.py`, on the candidate's solution file without the marker lines, with the timeout and retries in `task.json`. The evaluator controls what it measures. Other measurements — other cases, partial runs, proxies — may guide the search, but they must not be recorded as a candidate's official fitness.
+ 
+@@ -142,4 +124,3 @@ Recording happens inside the loop, after evaluation. A recorded candidate is fin
+ `evolve_run` returns `best_id`, `best_fitness` and `remaining`. `best_fitness` is the highest fitness recorded in the run so far. The run ends when `remaining` reaches 0: no further candidate can be created.
+ 
+ Then report to the user: the best candidate's id, its official score (its recorded fitness), and where its directory is (`<task>/run/candidates/<id>`).
+-
+diff --git a/plugins/dsh-evolve-loop/skills/writing-search-plugins/SKILL.md b/plugins/dsh-evolve-loop/skills/writing-search-plugins/SKILL.md
+index 745924e..f3951b8 100644
+--- a/plugins/dsh-evolve-loop/skills/writing-search-plugins/SKILL.md
++++ b/plugins/dsh-evolve-loop/skills/writing-search-plugins/SKILL.md
+@@ -5,23 +5,7 @@ description: Write, activate, repair, update, or remove the dynamic plugins that
+ 
+ # Write search plugins
+ 
+-A search plugin is host JavaScript that runs in DSH's dynamic plugin sandbox and changes the search through the `evolve` service. Query the real interface before writing code. Never infer an API from a service name or an example.
+-
+-## Workflow
+-
+-1. Call `cordis_inspect_list`, then the smallest set of `cordis_inspect_query` calls for what the code will use: the `evolve` service through `Service.listService`, any other service, and `Builtin.listBuiltins` for globals.
+-2. Write the host code and call `evolve_define`. It records a new plugin, or a new immutable version when you pass `plugin_id`. Nothing runs yet. Fix every warning it returns before activating.
+-3. Call `evolve_activate` with the `plugin_id`. It starts the newest version, or switches a running plugin to it. Read `changed`: it lists the slots whose provider stack changed. An activation that changed nothing comes back with a warning.
+-4. Run the next `evolve_run` chunk; it uses the active providers.
+-5. `evolve_deactivate` stops the plugin and the previous provider comes back. `remove: true` also deletes every version.
+-
+-`evolve_plugins` lists this session's plugins, their versions, which one runs, the last failure, and every slot's stack. Activation and deactivation are refused while `evolve_run` executes. Plugins belong to this session and disappear when DSH restarts.
+-
+-## The code
+-
+-The code is a plain JavaScript function body that returns a Cordis plugin object. It is not compiled.
+-
+-Do not use `import`, `require`, TypeScript, decorators, JSX, or globals not confirmed by `Builtin.listBuiltins`. `window`, `document`, `process`, `Buffer`, `fetch`, native timers, and `node:fs` do not exist here.
++Call `evolve_status` for the current provider stacks. A dynamic plugin returns a JavaScript object and registers its provider inside `apply(ctx)`. Use the API below for this experiment; Cordis inspection also describes services available only to the host.
+ 
+ ```js
+ return {
+@@ -32,45 +16,20 @@ return {
+       name: 'tournament',
+       async select(population, evolve) {
+         const alive = (await population.rows()).filter(row => row.survival === 'yes')
+-        // choose one of `alive` and return its id
++        return alive[Math.floor(Math.random() * alive.length)].id
+       },
+     }))
+   },
+ }
+ ```
+ 
+-- **`inject: ['evolve']`** makes `evolve` a hard dependency: the plugin waits until it exists, and `ctx.evolve` is allowed. Reading `ctx.x` without declaring `x` in `inject` is rejected. For an optional service, use `ctx.get('x')` and handle `undefined`.
+-- **Register inside `ctx.effect`.** `evolve.register` returns a disposer; `ctx.effect` owns it, so stopping, updating, or removing the plugin removes the provider. Registered outside `ctx.effect`, the provider stays after deactivation.
+-- **Give every provider a `name`.** It is what `evolve_status`, `evolve_plugins`, and `changed` show.
+-- **No side effects outside `apply()`.** Register event listeners with `ctx.on()`, and own every other subscription with `ctx.effect()`.
+-- **Persist search state with `evolve.files`**, never `node:fs` or `ctx.fs`.
+-- **Timers** are the `timer` service, not a builtin: query it, declare `inject: ['timer']`, then use `ctx.timeout(fn, ms)` or `ctx.interval(fn, ms)`.
+-
+-The slots, the methods each provider implements, the `evolve` operations a provider may call, and the rules a provider must keep are in `improving-the-search-strategy`. Load it before replacing a provider.
+-
+-## Live data
+-
+-Services, event payloads, and DSH objects are live runtime data. Do not `JSON.stringify`, `structuredClone`, or recursively copy them, and do not keep them in long-lived plugin state. Read the scalar fields you need.
+-
+-## Versions, update, and rollback
+-
+-- A plugin is the stable instance (`plugin_id`); a version is an immutable package (`package_id`).
+-- To change a plugin, call `evolve_define` with its `plugin_id` and the complete new code, then `evolve_activate`. Never create a second plugin for the same change: two plugins registering the same slot stack on top of each other.
+-- To go back, call `evolve_activate` with the older `package_id`.
+-- A failed update leaves the plugin stopped. Activate the last working `package_id` again to restore it.
+-
+-## Failures
+-
+-`evolve_activate` returns `ok: false` with `reason`, `message`, and usually `stack`. `evolve_plugins` shows the last failure of every plugin.
+-
+-| Failure | Check first |
++| Slot | Contract |
+ | --- | --- |
+-| `service "x" is not injected` | `ctx.x` used without `inject: ['x']`; declare it, or use `ctx.get('x')` with an absence check |
+-| `cannot get property "timer" without inject` | Declare `inject: ['timer']` |
+-| `host-half-failed` with a syntax error | `import`, `require`, TypeScript, JSX, or an unavailable global |
+-| Warning: waiting for services that do not exist | A name in `inject` is misspelled or not mounted; query `Service.listService` |
+-| Warning: no search slot changed | `evolve.register` is never called, or is called for an invalid slot |
+-| The provider stays after deactivation | `evolve.register` is outside `ctx.effect` |
+-| The next `evolve_run` fails in a provider | Read the error, define a fixed version, activate it; or deactivate to restore the previous provider |
++| loop | `async run(args, evolve)`. Select, generate, evaluate, record and apply survival in the order your search needs. |
++| select | `async select(population, evolve)`. Return a candidate ID, or `{parent, donors}`. Donors are optional distinct IDs of existing candidates in this run; exclude the primary parent and the candidate under construction. Archived or unevaluated candidates may be references. The list has no fixed length cap. |
++| survive | `async survive(population, evolve)`. Read rows, change membership or annotations and call `population.write(rows)`. The baseline has a null parent; other rows must name the actual primary parent used at allocation. |
++| guidance (V2) | `async guidance({parent, donors}, evolve)` returns candidate direction text and may inspect search evidence. A loop can also pass one candidate's `guidance` text to mutate. |
++
++Use `evolve.context()` for budget and run settings. Use `evolve.population().rows()` for history. `evolve.mutate({parent, donors})` allocates and dispatches one fixed worker. For split scheduling, call `evolve.allocate(parent)` followed by `evolve.spawnWorker(child.dir, {donors})`. Evaluate with `evolve.evaluate(child)` and append the official fitness, actual parent and survival flag to the population. Omitted donors on a new population row are filled from the host's dispatch record. Explicit donors must match order and IDs. `evolve.files` can store strategy state outside the protected candidate, evaluation, lineage, population and budget paths.
+ 
+-After a failure, define a new version under the same `plugin_id`; do not overwrite or duplicate it.
++Register through `ctx.evolve` using `ctx.effect`. Call `evolve_define` with the source, name and purpose, then `evolve_activate` and inspect `changed`. Reuse the plugin ID for revisions. Activate a prior package or call `evolve_deactivate` to roll back between chunks. `evolve_plugins` lists versions and activation failures.
 diff --git a/plugins/dsh-evolve-loop/src/evolve.js b/plugins/dsh-evolve-loop/src/evolve.js
-index 98b2cf2..b790d1c 100644
+index 98b2cf2..0434e20 100644
 --- a/plugins/dsh-evolve-loop/src/evolve.js
 +++ b/plugins/dsh-evolve-loop/src/evolve.js
 @@ -54,13 +54,14 @@ export class Evolve {
@@ -60,19 +392,35 @@ index 98b2cf2..b790d1c 100644
      const provider = this.getProvider('mutate')
      const fn = provider.mutate ?? provider.improve ?? provider
      if (typeof fn !== 'function') throw new Error('active mutate provider has no mutate method')
+@@ -242,13 +244,14 @@ export class Evolve {
+    * @param {string} parentId
+    * @returns {Promise<{ id: string, dir: string }>}
+    */
+-  async allocate(parentId) {
++  async allocate(parentId, donors = []) {
+     const run = this.currentRun()
+     run.signal.throwIfAborted()
+     if (!(await isCandidate(run.root, parentId))) {
+       throw new Error(`cannot allocate from ${String(parentId)}: it is not a candidate of this run`)
+     }
+     const created = await allocateCandidate(run.root, await readBudget(run.root), parentId)
++    if (this.searchBoundary) await this.searchBoundary.recordLineage(created.id, parentId, donors)
+     return { id: created.id, dir: created.path }
+   }
+ 
 diff --git a/plugins/dsh-evolve-loop/src/index.js b/plugins/dsh-evolve-loop/src/index.js
-index 157d398..8763693 100644
+index 157d398..1fc551f 100644
 --- a/plugins/dsh-evolve-loop/src/index.js
 +++ b/plugins/dsh-evolve-loop/src/index.js
 @@ -12,6 +12,7 @@ import { budgetReport } from './budget.js'
  import { runPaths } from './candidates.js'
  import { Evolve, DEFAULT_MAX_POPULATION, DEFAULT_K } from './evolve.js'
  import { registerRuntimeTools } from './runtime.js'
-+import { createSearchBoundary, modifierGuard } from './search-boundary.js'
++import { createSearchBoundary, modifierGuard, modifierPresentation } from './search-boundary.js'
  
  export const name = 'dsh-evolve-loop'
  export const inject = ['tools', 'subagents']
-@@ -25,7 +26,12 @@ const RUN_REMINDER = 'Reminder: before changing the search, load the improving-t
+@@ -25,7 +26,14 @@ const RUN_REMINDER = 'Reminder: before changing the search, load the improving-t
   * @param {object} ctx - the plugin context.
   */
  export function apply(ctx) {
@@ -83,10 +431,12 @@ index 157d398..8763693 100644
 +  evolve.searchBoundary = createSearchBoundary(evolve, variant)
 +  ctx.provide('organonSearch', { mount: evolve.searchBoundary.mount })
 +  ctx.tools.guard(execution => modifierGuard(execution, evolve))
++  ctx.on('system-prompt/assemble', async (_assembly, { agent }, next) =>
++    modifierPresentation(await next(), agent, evolve))
    ctx.provide('evolve', evolve)
  
    ctx.tools.register(defineTool({
-@@ -37,7 +43,7 @@ export function apply(ctx) {
+@@ -37,7 +45,7 @@ export function apply(ctx) {
        + 'candidate, scores it with the task\'s evaluator (evaluator/evaluator.py, settings in task.json), records it '
        + 'in population.jsonl, and culls excess candidates. '
        + 'Returns the best candidate ID, its fitness, and remaining budget: { best_id, best_fitness, remaining }. '
@@ -96,7 +446,7 @@ index 157d398..8763693 100644
        max_budget: {
          type: 'integer',
 diff --git a/plugins/dsh-evolve-loop/src/providers/loop.js b/plugins/dsh-evolve-loop/src/providers/loop.js
-index 4616740..9464c82 100644
+index 4616740..798aec9 100644
 --- a/plugins/dsh-evolve-loop/src/providers/loop.js
 +++ b/plugins/dsh-evolve-loop/src/providers/loop.js
 @@ -42,10 +42,11 @@ export async function run(args, evolve) {
@@ -104,7 +454,7 @@ index 4616740..9464c82 100644
  
      // Selection
 -    const parentId = await evolve.select(population)
-+    const selection = await evolve.select(population)
++    const selection = structuredClone(await evolve.select(population))
 +    const parentId = typeof selection === 'string' ? selection : selection.parent
  
      // Mutation & Allocation
@@ -121,6 +471,27 @@ index 4616740..9464c82 100644
        fitness,
        survival: 'yes',
      })
+diff --git a/plugins/dsh-evolve-loop/src/providers/mutate.js b/plugins/dsh-evolve-loop/src/providers/mutate.js
+index 35e316b..6191211 100644
+--- a/plugins/dsh-evolve-loop/src/providers/mutate.js
++++ b/plugins/dsh-evolve-loop/src/providers/mutate.js
+@@ -55,6 +55,7 @@ export function defaultInstruction(parentFitness) {
+ export async function mutate(options, evolve) {
+   const {
+     parent,
++    donors,
+     parentFitness: providedFitness,
+     instruction: providedInstruction,
+     name: workerName,
+@@ -79,7 +80,7 @@ export async function mutate(options, evolve) {
+   }
+ 
+   const instruction = providedInstruction ?? defaultInstruction(parentFitness)
+-  const candidate = await evolve.allocate(parent)
++  const candidate = donors?.length ? await evolve.allocate(parent, donors) : await evolve.allocate(parent)
+   const workerLabel = workerName ?? description ?? 'mutator'
+ 
+   try {
 diff --git a/plugins/dsh-evolve-loop/src/runtime.js b/plugins/dsh-evolve-loop/src/runtime.js
 index 37de335..cb3921f 100644
 --- a/plugins/dsh-evolve-loop/src/runtime.js
@@ -153,10 +524,10 @@ index 37de335..cb3921f 100644
      },
 diff --git a/plugins/dsh-evolve-loop/src/search-boundary.js b/plugins/dsh-evolve-loop/src/search-boundary.js
 new file mode 100644
-index 0000000..b5636c2
+index 0000000..1471b51
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/src/search-boundary.js
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,278 @@
 +// Experiment permissions around Organon's native providers. Scheduling lives in
 +// the submitted async functions; the host never interprets a search plan.
 +import { lstat, readFile } from 'node:fs/promises'
@@ -170,14 +541,26 @@ index 0000000..b5636c2
 +  'cordis_inspect_list', 'cordis_inspect_query', 'evolve_run', 'evolve_status',
 +  'evolve_define', 'evolve_activate', 'evolve_deactivate', 'evolve_plugins',
 +])
-+export function modifierGuard({ agent, name }, evolve) {
++function isWorker(agent, evolve) {
 +  const header = agent?.session?.header
 +  if (header?.origin === 'subagent' && evolve?.running) {
 +    const run = evolve.currentRun()
 +    if (header.parentSession === run.agent.id && typeof header.cwd === 'string'
-+        && dirname(header.cwd) === join(run.root, 'candidates')) return
++        && dirname(header.cwd) === join(run.root, 'candidates')) return true
 +  }
++  return false
++}
++export function modifierGuard({ agent, name }, evolve) {
++  if (isWorker(agent, evolve)) return
 +  if (!modifierTools.has(name)) return 'The modifier may inspect evidence and install search providers only.'
++}
++
++export function modifierPresentation(assembly, agent, evolve) {
++  if (isWorker(agent, evolve)) return assembly
++  return { ...assembly, tools: assembly.tools.filter(tool => modifierTools.has(tool.name)),
++    sections: assembly.sections.filter(section =>
++      !section.name.startsWith('tool:') || modifierTools.has(section.name.slice(5))),
++  }
 +}
 +
 +export function scopedHostCode(code) {
@@ -198,7 +581,7 @@ index 0000000..b5636c2
 +    checkWrite()
 +    const parts = relative(files.root, files.resolve(path)).split(sep)
 +    const top = parts[0].toLowerCase()
-+    if (['', 'budget.json', 'population.jsonl', 'candidates', 'evals'].includes(top)) {
++    if (['', 'budget.json', 'population.jsonl', 'candidates', 'evals', 'lineage'].includes(top)) {
 +      throw new Error('This path is owned by the candidate, budget, population or evaluator service.')
 +    }
 +    let absolute = files.root
@@ -225,6 +608,7 @@ index 0000000..b5636c2
 +  const writableSlots = variant === 'v2' ? ['loop', 'select', 'survive', 'guidance'] : ['loop', 'select', 'survive']
 +  const description = 'Register ' + writableSlots.join(', ') + ' using ctx.effect(() => ctx.evolve.register(slot, provider)). '
 +    + 'Use native async provider signatures. The worker, evaluator and material builder are fixed. '
++    + 'Select a run-owned parent and optional distinct donors from the same run, excluding the parent and child. '
 +    + (variant === 'v2' ? 'Guidance returns candidate direction text only. ' : '')
 +  const pendingWorkers = new Map()
 +  const activeWorkers = new Map()
@@ -240,6 +624,18 @@ index 0000000..b5636c2
 +    return { id, dir: candidatePath(root, id) }
 +  }
 +
++  function donorIds(donors, parent, child) {
++    if (!Array.isArray(donors) || donors.some(id => typeof id !== 'string' || id === parent || id === child)
++        || new Set(donors).size !== donors.length) {
++      throw new Error('Use distinct donor IDs from this run, excluding the primary parent and child.')
++    }
++    return [...donors]
++  }
++
++  function recordLineage(id, parent, donors) {
++    return evolve.files.write('lineage/' + id + '.json', JSON.stringify({ parent, donors }))
++  }
++
 +  function population() {
 +    const pop = evolve.population()
 +    async function checked(row) {
@@ -247,6 +643,22 @@ index 0000000..b5636c2
 +      // Snapshot before the await so the checked data is what gets written.
 +      const record = structuredClone(row)
 +      await candidate(record.id)
++      const entry = await evolve.files.read('lineage/' + record.id + '.json')
++      // Older checkouts only recorded ancestry in the population. Preserve a
++      // plausible original declaration, without accepting a new one from the plugin.
++      const lineage = record.id === 'c000000' ? { parent: null } : entry ? JSON.parse(entry)
++        : (await pop.rows()).find(previous => previous.id === record.id)
++      if (!lineage || record.parent !== lineage.parent) throw new Error('Parent does not match allocation for ' + record.id)
++      if (record.id !== 'c000000') {
++        await candidate(record.parent)
++        if (record.parent >= record.id) throw new Error('The parent must precede its child.')
++      }
++      const actual = donorIds(lineage.donors ?? [], record.parent, record.id)
++      if (!entry) await Promise.all(actual.map(candidate))
++      if (record.donors !== undefined && JSON.stringify(donorIds(record.donors, record.parent, record.id)) !== JSON.stringify(actual)) {
++        throw new Error('Donors must match the ordered references supplied to the worker.')
++      }
++      if (actual.length) record.donors = actual
 +      const evidence = await evolve.files.read('evals/' + record.id + '.json')
 +      if (!evidence || !Number.isFinite(record.fitness) || JSON.parse(evidence).fitness !== record.fitness) {
 +        throw new Error('Population fitness must match the official evaluation for ' + record.id)
@@ -262,18 +674,18 @@ index 0000000..b5636c2
 +    })
 +  }
 +
-+  async function workerOptions(options = {}) {
++  async function workerOptions(options = {}, child) {
 +    const { parent, donors = [], guidance, parentFitness, ...rest } = options
 +    if (Object.keys(rest).length || (guidance !== undefined && variant !== 'v2')) {
 +      throw new Error('Worker settings are fixed. Use parent, optional donor IDs, and V2-only guidance.')
 +    }
++    const ids = donorIds(donors, parent, child)
 +    await candidate(parent)
++    const references = await Promise.all(ids.map(candidate))
 +    if (parentFitness !== undefined &&
 +        (await evolve.population().rows()).find(row => row.id === parent)?.fitness !== parentFitness) {
 +      throw new Error('Parent fitness must match its recorded evaluation.')
 +    }
-+    if (!Array.isArray(donors)) throw new Error('donors must be candidate IDs')
-+    const ids = [...donors]
 +    const direction = guidance ?? (variant === 'v2'
 +      ? await guidanceCall.run(true, () => evolve.getProvider('guidance').guidance({ parent, donors: [...ids] }, api)) : '')
 +    if (typeof direction !== 'string') throw new Error('Guidance must return candidate direction text.')
@@ -283,13 +695,12 @@ index 0000000..b5636c2
 +    if (ids.length) {
 +      const { task } = evolve.currentRun()
 +      const { program } = JSON.parse(await readFile(join(task, 'task.json'), 'utf8'))
-+      for (const id of ids) {
-+        const donor = await candidate(id)
-+        instruction += '\n\nReference candidate ' + id + ':\n' + await readFile(join(donor.dir, program), 'utf8')
++      for (const donor of references) {
++        instruction += '\n\nReference candidate ' + donor.id + ':\n' + await readFile(join(donor.dir, program), 'utf8')
 +      }
 +    }
 +    if (direction) instruction += '\n\nSuggested direction for this candidate:\n' + direction
-+    return { parent, instruction }
++    return { parent, instruction, donors: ids }
 +  }
 +
 +  function provider(slot) {
@@ -339,11 +750,16 @@ index 0000000..b5636c2
 +        }
 +        options = {}
 +      }
-+      const configured = await workerOptions({ ...options, parent })
++      const child = dir.split(sep).at(-1)
++      if (options.parent !== undefined && options.parent !== parent) throw new Error('Parent does not match allocation for ' + child)
++      const configured = await workerOptions({ ...options, parent }, child)
 +      if (!pendingWorkers.delete(dir)) throw new Error('Candidate already dispatched or evaluated.')
-+      const job = evolve.spawnWorker(dir, configured.instruction ?? standard, {
-+        label: 'mutator', persona: defaultPersona(),
-+      })
++      const job = (async () => {
++        if (configured.donors?.length) await recordLineage(child, parent, configured.donors)
++        return evolve.spawnWorker(dir, configured.instruction ?? standard, {
++          label: 'mutator', persona: defaultPersona(),
++        })
++      })()
 +      activeWorkers.set(dir, job)
 +      try { return await job } finally { activeWorkers.delete(dir) }
 +    },
@@ -388,14 +804,14 @@ index 0000000..b5636c2
 +    if (typeof plugin === 'function') return plugin(ctx)
 +    return plugin.apply(ctx)
 +  }
-+  return { description, mount, workerOptions }
++  return { description, mount, workerOptions, recordLineage }
 +}
 diff --git a/plugins/dsh-evolve-loop/tests/search-boundary.spec.ts b/plugins/dsh-evolve-loop/tests/search-boundary.spec.ts
 new file mode 100644
-index 0000000..74d474e
+index 0000000..1636726
 --- /dev/null
 +++ b/plugins/dsh-evolve-loop/tests/search-boundary.spec.ts
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,191 @@
 +import { cp, mkdir, mkdtemp, readFile } from 'node:fs/promises'
 +import { fileURLToPath } from 'node:url'
 +import { join } from 'node:path'
@@ -443,6 +859,52 @@ index 0000000..74d474e
 +  }
 +  return { activate, workers, call, task }
 +}
++
++it('binds population ancestry to allocation and dispatch on both generation paths', async () => {
++  const { activate, call, workers, task } = await setup('v1')
++  await call('evolve_run', { max_budget: 4, candidates: 1 })
++  const result = await activate(`return {apply(ctx) { ctx.evolve.register('loop', async (_, e) => {
++    async function refused(f) { try { await f() } catch { return }; throw Error('Accepted invalid lineage') }
++    const p = 'c000000', d = 'c000001', pop = e.population()
++    for (const donors of [[p], [d,d], ['c999999'], [5]]) {
++      await refused(() => e.mutate({parent:p, donors}))
++    }
++    const first = await e.mutate({parent:p, donors:[d]})
++    const child = await e.allocate(d)
++    await refused(() => e.spawnWorker(child.dir, {donors:[child.id]}))
++    await e.spawnWorker(child.dir, {donors:[first.id,p]})
++    const row = { id:child.id, parent:d, fitness:await e.evaluate(child), survival:'yes' }
++    for (const parent of [null,p,child.id,'c999999']) await refused(() => pop.append({...row,parent}))
++    await refused(() => pop.append({...row,donors:[p,first.id]}))
++    await pop.append(row)
++    const rows = await pop.rows()
++    await refused(() => pop.write(rows.map(r => r.id === d ? {...r,parent:child.id} : r)))
++    await refused(() => pop.write(rows.map(r => r.id === p ? {...r,parent:d} : r)))
++    await refused(() => e.files.write('lineage/' + d + '.json','{}'))
++    await pop.write(rows)
++    return (await pop.rows()).at(-1)
++  })} }`)
++  expect(result.ok, result.message).toBe(true)
++  expect(await call('evolve_run', {max_budget:4,candidates:2})).toMatchObject({
++    id:'c000003',parent:'c000001',donors:['c000002','c000000'],
++  })
++  expect(workers).toHaveLength(3)
++  expect(JSON.parse(await readFile(join(task,'run/lineage/c000002.json'),'utf8'))).toEqual({parent:'c000000',donors:['c000001']})
++})
++
++it('filters modifier schemas and tool instructions before the first model call', async () => {
++  await setup('v2')
++  const names = ['read','write','edit','bash','candidate-builder','plugin_manager']
++  ctx.systemPrompt.tools(() => ({ schemas: names.map(name => ({name,description:name,parameters:{type:'object',properties:{}}})) }))
++  for (const name of names) ctx.systemPrompt.section({name:'tool:'+name,order:100,text:name})
++  const assembly = await ctx.systemPrompt.assemble({agent:{session:{header:{}}}} as never)
++  const visible = assembly.tools.map((tool:any) => tool.name)
++  expect(visible).toEqual(expect.arrayContaining(['read','evolve_define','evolve_run']))
++  for (const name of names.slice(1)) {
++    expect(visible).not.toContain(name)
++    expect(assembly.sections.map((s:any)=>s.name)).not.toContain('tool:'+name)
++  }
++})
 +
 +it('runs a stateful native async loop across chunks, with custom scheduling, survival and archives', async () => {
 +  const { activate, call, workers, task } = await setup('v1')
