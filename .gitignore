@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+runs/
+test_runs/
+/organon_upstream/
+/benchmarks/ale/tests/cli_smoke_result.json
+/benchmarks/ale/tests/smoke_results.json

@@ -1,0 +1,14 @@
+{
+  "task_id": "ahc026",
+  "candidate_id": "smoke_cpp",
+  "source_path": "autoresearch_rebuild/benchmarks/ale/samples/valid.cpp",
+  "language": "cpp",
+  "public_seed": 0,
+  "config": {
+    "compile_timeout_seconds": 60,
+    "run_timeout_seconds": 5,
+    "score_timeout_seconds": 20,
+    "generate_timeout_seconds": 20,
+    "output_limit_bytes": 2097152
+  }
+}
